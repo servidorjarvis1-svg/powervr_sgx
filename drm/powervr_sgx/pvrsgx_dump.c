@@ -54,6 +54,11 @@ static void dump_regs(struct seq_buf *sb, struct pvrsgx_device *sdev)
 		{ NULL, edm ? sgx_cr_bif_dir_list_base(edm) : 0 },
 		{ "EDM_TASK_REG0", cr->edm_task_reg0 },
 		{ "EDM_TASK_REG1", cr->edm_task_reg1 },
+		/* test: the SGX545's DPM page counters (UKERNEL.md section 6) */
+		{ "DPM_TA_HEAD", 0x700 },
+		{ "DPM_TA_TAIL", 0x710 },
+		{ "DPM_PAGES", 0x724 },
+		{ "DPM_PAGES_GBL", 0x72c },
 	};
 
 	for (int i = 0; i < ARRAY_SIZE(regs); i++) {
