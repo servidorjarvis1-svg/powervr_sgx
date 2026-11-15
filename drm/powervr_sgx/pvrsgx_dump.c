@@ -59,6 +59,10 @@ static void dump_regs(struct seq_buf *sb, struct pvrsgx_device *sdev)
 		{ "DPM_TA_TAIL", 0x710 },
 		{ "DPM_PAGES", 0x724 },
 		{ "DPM_PAGES_GBL", 0x72c },
+		{ "DPM_3D_HEAD", 0x70c },
+		{ "DPM_3D_TAIL", 0x71c },
+		{ "DPM_3D_PAGES", 0x728 },
+		{ "DPM_3D_PAGES_GBL", 0x730 },
 	};
 
 	for (int i = 0; i < ARRAY_SIZE(regs); i++) {
