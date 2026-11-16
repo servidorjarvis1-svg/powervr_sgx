@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright © 2026 Joseph Telaak */
 
+#include <drm/drm_cache.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_prime.h>
 #include <drm/drm_vma_manager.h>
 
 #include <linux/dma-buf.h>
+#include <linux/moduleparam.h>
 #include <linux/pagemap.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 
 #include <uapi/drm/powervr_sgx_drm.h>
 
+#include "pvrsgx_device.h"
 #include "pvrsgx_drv.h"
 #include "pvrsgx_gem.h"
 
@@ -87,11 +90,22 @@ struct drm_gem_object *pvrsgx_gem_create_object(struct drm_device *drm, size_t s
 	return &bo->base.base;
 }
 
+/*
+ * Off by default: x86-32 kernels up to at least 7.3 neither skip HIGHMEM pages
+ * in set_pages_array_wc() (an oops) nor give them a PAT memory type (their
+ * write-combined user mappings turn cached). Turn it on with a kernel that
+ * does both.
+ */
+static bool pvrsgx_highmem;
+module_param_named(highmem, pvrsgx_highmem, bool, 0444);
+MODULE_PARM_DESC(highmem, "Allow buffers in HIGHMEM on 32-bit kernels (needs x86 CPA/PAT HIGHMEM support)");
+
 int pvrsgx_ioctl_create_bo(struct drm_device *drm, void *data, struct drm_file *file)
 {
 	struct drm_powervr_sgx_ioctl_create_bo_args *args = data;
 	struct drm_gem_shmem_object *shmem;
 	struct address_space *m;
+	bool highmem;
 	int err;
 
 	if (args->_padding_c || (args->flags & ~PVRSGX_BO_FLAGS_MASK) ||
@@ -107,18 +121,24 @@ int pvrsgx_ioctl_create_bo(struct drm_device *drm, void *data, struct drm_file *
 	to_pvrsgx_bo(&shmem->base)->flags = args->flags;
 	/* Pages the GPU can address; shmem's RETRY_MAYFAIL and NOWARN stay. */
 	m = shmem->base.filp->f_mapping;
-	mapping_set_gfp_mask(m, (mapping_gfp_mask(m) & ~__GFP_HIGHMEM) | __GFP_DMA32);
+	highmem = PVRSGX_GPU_HIGHMEM && pvrsgx_highmem;
+	if (!highmem)
+		mapping_set_gfp_mask(m, (mapping_gfp_mask(m) & ~__GFP_HIGHMEM) | __GFP_DMA32);
 	/*
 	 * Without x86's write-combined linear map the zeroing's lines stay dirty:
 	 * clean them now, before any write through a write-combined mapping.
+	 * HIGHMEM pages have no linear map to make write-combined either, so on
+	 * x86 they are flushed here too.
 	 */
-	if (!IS_ENABLED(CONFIG_X86)) {
+	if (!IS_ENABLED(CONFIG_X86) || highmem) {
 		struct sg_table *sgt = drm_gem_shmem_get_pages_sgt(shmem);
 
 		if (IS_ERR(sgt)) {
 			drm_gem_object_put(&shmem->base);
 			return PTR_ERR(sgt);
 		}
+		if (IS_ENABLED(CONFIG_X86))
+			drm_clflush_sg(sgt);
 	}
 
 	err = drm_gem_handle_create(file, &shmem->base, &args->handle);
