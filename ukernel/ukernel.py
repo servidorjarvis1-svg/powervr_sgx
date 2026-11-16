@@ -106,6 +106,14 @@ FP_TA_BUSY, FP_3D_BUSY, FP_COUNTS = 0x3d, 0x3e, 0x3f   # TA-busy ticks, 3D-busy 
 # (0x630 b2=TA slot, b1=3D slot, b0=first-kick slot), like the DDK (interleave_ours.py --order overlap). 3D is
 # strictly one at a time (a 3D queue in render_complete). The kernel driver credits 2 behind `overlap`.
 OVERLAP = os.environ.get("UK_OVERLAP") == "1"
+# Test: save_ta_state + the 3D free-list load at every 3D start instead of once per PB, to see
+# whether the DPM's in-use count (0x724) then drains after big scenes (2026-11-15). Off by
+# default -> the production image stays byte-identical.
+LOAD3D_EVERY = os.environ.get("UK_3DLOADEVERY") == "1"
+# Diagnostic: after a render's DPM free (serial: no scene open), reload the TA and 3D free lists
+# from the live ring with the in-use count it implies ((head - tail - 1) mod pages), because big
+# scenes leave 0x724/0x728 counted too high (2026-11-15). Off by default.
+RESYNC = os.environ.get("UK_RESYNC") == "1"
 TD_ENTRY = 0x19      # control block +0x64: the in-flight 3D's RT-data entry (0 = no 3D). Set at the 3D kick,
                      # cleared at the DPM free. The slot pick reads it ("is a 3D in flight, and on 0x630 b1").
 TD_RD = 0x1c         # control block +0x70: the in-flight 3D's render details. render_complete reads it instead
@@ -1894,10 +1902,11 @@ def build(a):
     # Load the 3D free list + save_ta_state only when the PB changed (the per-PB rule, same
     # as the TA side: the DDK loads once per PB and the HW keeps the ring in sync). When it
     # is unchanged, 0x63c=3 and the ISP/PBE state (D3_CONST/D3_RD) below still run every 3D.
-    a.i(f"ld.a.d r4, r17, #{PB_3D_LOADED} [moe]")
-    a.i("wdf")
-    a.i("test.xor.eq p0, r4, r11")                    # same PB already loaded -> skip
-    a.i("(p0) ba skip_3d_fl")
+    if not LOAD3D_EVERY:
+        a.i(f"ld.a.d r4, r17, #{PB_3D_LOADED} [moe]")
+        a.i("wdf")
+        a.i("test.xor.eq p0, r4, r11")                # same PB already loaded -> skip
+        a.i("(p0) ba skip_3d_fl")
     # save_ta_state: stash the TA page counters in the PB descriptor, shifted.
     a.i(f"ldr r4, #{0x700 // 4}")
     a.i(f"ldr r5, #{0x710 // 4}")
@@ -2314,6 +2323,41 @@ def build(a):
     a.i(f"st.a.d r17, #{SC_OOM}, r4 [moe]")           # clear SC_OOM
     a.i(f"st.a.d r17, #{SC_OOM_PENDING}, r4 [moe]")   # any queued overlap is moot: the scene finished
     a.label("render_complete_normal")
+    if RESYNC and not OVERLAP:
+        a.i(f"ld.a.d r9, r17, #{SC_PB} [moe]")         # the scene's PB descriptor
+        a.i(f"ldr r10, #{0x700 // 4}")                  # TA head word (b0-15 = the head page)
+        a.i(f"ldr r14, #{0x710 // 4}")                  # TA tail
+        a.i("limm r15, #0xffff")
+        a.i("wdf")
+        a.i("ld.a.d r16, r9, #1 [moe]")                 # pb+0x4: pages
+        a.i("and r11, r10, r15")                        # head page
+        a.i("and r15, r14, r15")                        # tail page
+        a.i("wdf")
+        a.i("imae r15, r15, #1, #1 [t2=u32]")           # tail + 1
+        a.i("test.isub16.neg p0, r11, r11, r15")        # count = head - (tail + 1); p0 = negative
+        a.i("(p0) ba rs_wrap")
+        a.i("ba rs_count")
+        a.label("rs_wrap")
+        a.i("imae r11, r11, #1, r16 [t2=u32]")          # + pages
+        a.label("rs_count")
+        a.i("limm r15, #0xffff")
+        a.i("and r11, r11, r15")
+        # the TA's list: head, tail << 16, count, then load it
+        a.i(f"str #{0x61c // 4}, r10")
+        a.i("shl r14, r14, #16")
+        a.i(f"str #{0x648 // 4}, r14")
+        a.i(f"str #{0x638 // 4}, r11")
+        a.dpm_freelist(3, CR_DPM_TA_FL, 0x1)
+        # the 3D's: list address, the same head and tail, the count
+        a.i("ld.a.d r16, r9, #4 [moe]")                 # pb+0x10: free-list address
+        a.i("wdf")
+        a.i("shr r16, r16, #4")
+        a.i("shl r16, r16, #4")
+        a.i(f"str #{0x600 // 4}, r16")
+        a.i(f"str #{0x604 // 4}, r10")
+        a.i(f"str #{0x64c // 4}, r14")
+        a.i(f"str #{0x660 // 4}, r11")
+        a.dpm_freelist(5, CR_DPM_3D_FL, 0x2)
     if OVERLAP:
         a.i(f"ld.a.d r0, r17, #{TD_RD} [moe]")   # the completing 3D's render details (SC_RD may now be N+1's TA)
     else:
