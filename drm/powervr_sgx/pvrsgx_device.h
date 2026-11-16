@@ -24,6 +24,16 @@
 #include "pvrsgx_core.h"
 #include "pvrsgx_hw.h"
 
+/*
+ * Whether shmem buffers may come from HIGHMEM. The GPU's MMU reaches any page
+ * below 4 GiB; a 32-bit kernel without 64-bit physical addresses has no
+ * ZONE_DMA32 and all of its pages are below 4 GiB, so keeping buffers in
+ * lowmem only starves the kernel. Kernel objects (pvrsgx_kmem) stay in lowmem:
+ * changing a page's caching needs its linear mapping.
+ */
+#define PVRSGX_GPU_HIGHMEM \
+	(!IS_ENABLED(CONFIG_ZONE_DMA32) && !IS_ENABLED(CONFIG_PHYS_ADDR_T_64BIT))
+
 /* Device-wide ranges for kernel-owned objects. */
 enum pvrsgx_krange {
 	PVRSGX_KRANGE_KDATA,	/* firmware only */
