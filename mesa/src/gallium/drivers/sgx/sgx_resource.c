@@ -1320,17 +1320,33 @@ sgx_transfer_unmap(struct pipe_context *pctx, struct pipe_transfer *ptrans)
 
 /* Shared and scanout buffers are linear, so LINEAR (or "any", INVALID) is the
  * one modifier: GBM's create_with_modifiers (mpv, wlroots) asks for it with
- * the list a KMS plane advertises, simpledrm's being just LINEAR. */
+ * the list a KMS plane advertises, simpledrm's being just LINEAR.  The buffer
+ * is made shared, which is what makes it linear (is_render_target); a template
+ * shareable() refuses can't be linear, so it gets no buffer. */
 static struct pipe_resource *
 sgx_resource_create_with_modifiers(struct pipe_screen *pscreen,
                                    const struct pipe_resource *templ,
                                    const uint64_t *modifiers, int count)
 {
+   struct pipe_resource linear;
+
+   if (!shareable(templ))
+      return NULL;
    for (int i = 0; i < count; i++)
       if (modifiers[i] == DRM_FORMAT_MOD_LINEAR ||
-          modifiers[i] == DRM_FORMAT_MOD_INVALID)
-         return sgx_resource_create(pscreen, templ);
+          modifiers[i] == DRM_FORMAT_MOD_INVALID) {
+         linear = *templ;
+         linear.bind |= PIPE_BIND_SHARED;
+         return sgx_resource_create(pscreen, &linear);
+      }
    return NULL;
+}
+
+/* LINEAR only for what can be shared: 4 bytes a pixel (shareable()). */
+static bool
+format_shareable(enum pipe_format format)
+{
+   return util_format_get_blocksize(format) == 4;
 }
 
 static void
@@ -1338,8 +1354,8 @@ sgx_query_dmabuf_modifiers(struct pipe_screen *pscreen, enum pipe_format format,
                            int max, uint64_t *modifiers,
                            unsigned int *external_only, int *count)
 {
-   *count = 1;
-   if (max < 1)
+   *count = format_shareable(format) ? 1 : 0;
+   if (!*count || max < 1)
       return;
    modifiers[0] = DRM_FORMAT_MOD_LINEAR;
    if (external_only)
@@ -1352,7 +1368,7 @@ sgx_is_dmabuf_modifier_supported(struct pipe_screen *pscreen, uint64_t modifier,
 {
    if (external_only)
       *external_only = false;
-   return modifier == DRM_FORMAT_MOD_LINEAR;
+   return modifier == DRM_FORMAT_MOD_LINEAR && format_shareable(format);
 }
 
 void
