@@ -71,6 +71,7 @@ sgx_tex_format(enum pipe_format format)
    case PIPE_FORMAT_Z24X8_UNORM:
    case PIPE_FORMAT_Z24_UNORM_S8_UINT:
    case PIPE_FORMAT_Z32_FLOAT:
+   case PIPE_FORMAT_Z32_FLOAT_S8X24_UINT:
    /* 32-bit words returned unchanged (docs/GL3.md, H2): R32 one a texel;
     * RG32 and RGBA32 as an R32 plane a channel (sgx_tex_raw32), the
     * compiler reading each */

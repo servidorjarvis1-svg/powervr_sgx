@@ -340,6 +340,10 @@ sgx_is_format_supported(struct pipe_screen *pscreen, enum pipe_format format,
            * (sgx_tex_bpp): GL_ARB_texture_rg, which X's glamor needs on GLES
            * for its 8-bit pixmaps (glyphs, masks) */
           format != PIPE_FORMAT_R8_UNORM && format != PIPE_FORMAT_R8G8_UNORM &&
+          /* sRGB (EXT_sRGB): rendered as its linear format (sgx_resource_target)
+           * -- ES3 SPIKE: no encode on the way out yet */
+          format != PIPE_FORMAT_R8G8B8A8_SRGB &&
+          format != PIPE_FORMAT_B8G8R8A8_SRGB &&
           /* integer, of 32 bits or less: the program packs the word
            * (rt_packed); reachable once EXT_texture_integer is */
           format != PIPE_FORMAT_R8G8B8A8_UINT &&
@@ -364,7 +368,11 @@ sgx_is_format_supported(struct pipe_screen *pscreen, enum pipe_format format,
        * stored (no ZLS yet), so they are good within one render. */
       if (format != PIPE_FORMAT_Z16_UNORM &&
           format != PIPE_FORMAT_Z24X8_UNORM &&
-          format != PIPE_FORMAT_Z24_UNORM_S8_UINT)
+          format != PIPE_FORMAT_Z24_UNORM_S8_UINT &&
+          /* ARB_depth_buffer_float: the ZLS keeps every depth as float32
+           * already (zls_index); the CPU copy packs its own format */
+          format != PIPE_FORMAT_Z32_FLOAT &&
+          format != PIPE_FORMAT_Z32_FLOAT_S8X24_UINT)
          return false;
    }
    if (usage & PIPE_BIND_VERTEX_BUFFER) {
