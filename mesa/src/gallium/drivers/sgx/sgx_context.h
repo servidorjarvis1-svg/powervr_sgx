@@ -62,6 +62,12 @@ struct sgx_const {
 /* unit u's level count (textureQueryLevels, and the compiler's own level
  * choice for word-by-word fetches) at SGX_K_LEVELS + u, a raw integer */
 #define SGX_K_LEVELS       1096
+/* unit u's texture state for a 2D array's layers (sgx_program.c
+ * lower_tex_array), raw words from SGX_K_TEXSTATE + 10u: T0-T3 for the
+ * bound sampler, T0-T3 for a texelFetch, the bytes from one layer to the
+ * next, the view's layer count */
+#define SGX_K_TEXSTATE     1112
+#define SGX_K_TEXSTATE_N   10
 
 /* a fragment program's dependent samples, and their texture state blocks
  * (the compiler's sgx_sample_info.state: one per way a unit is read, 4 SA

@@ -276,6 +276,54 @@ lower_txs_int(nir_builder *b, nir_tex_instr *tex)
    return true;
 }
 
+/* A sample of a 2D array (docs/GL3.md "texture arrays"): no layer field is
+ * known in the texture words, so each layer is a 2D texture of its own at a
+ * layer stride (sgx_tex_offset), and the sample is a 2D one whose state the
+ * program builds: the unit's words (SGX_K_TEXSTATE, the texelFetch ones for a
+ * fetch) with T2, the address, moved on to layer clamp(floor(z + 0.5), 0,
+ * n - 1).  The compiler takes the state from the texture_handle source
+ * (smp's state operand in temporaries; hardware: hwt_smp, ISA.md).  Needs
+ * the native integers. */
+static bool
+lower_tex_array(nir_builder *b, nir_tex_instr *tex, void *data)
+{
+   int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+
+   if (!tex->is_array || tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
+       nir_tex_instr_is_query(tex) || ci < 0 ||
+       tex->texture_index >= SGX_K_SIZE_UNITS ||
+       nir_tex_instr_src_index(tex, nir_tex_src_texture_handle) >= 0 ||
+       (tex->op != nir_texop_tex && tex->op != nir_texop_txb &&
+        tex->op != nir_texop_txl))
+      return false;
+   b->cursor = nir_before_instr(&tex->instr);
+   unsigned base = SGX_K_TEXSTATE + SGX_K_TEXSTATE_N * tex->texture_index;
+   bool fetch = tex->backend_flags & SGX_TEX_FETCH;
+   nir_def *words =
+      nir_load_uniform(b, 4, 32, nir_imm_int(b, 0), .base = base + (fetch ? 4 : 0),
+                       .range = 4, .dest_type = nir_type_int32);
+   nir_def *sl =
+      nir_load_uniform(b, 2, 32, nir_imm_int(b, 0), .base = base + 8, .range = 2,
+                       .dest_type = nir_type_int32);
+   nir_def *coord = tex->src[ci].src.ssa;
+   nir_def *layer = nir_f2i32(
+      b, nir_ffloor(b, nir_fadd_imm(b, nir_channel(b, coord, 2), 0.5f)));
+
+   layer = nir_imin(b, nir_imax(b, layer, nir_imm_int(b, 0)),
+                    nir_iadd_imm(b, nir_channel(b, sl, 1), -1));
+   nir_def *t2 = nir_iadd(b, nir_channel(b, words, 2),
+                          nir_imul(b, layer, nir_channel(b, sl, 0)));
+   nir_def *state = nir_vec4(b, nir_channel(b, words, 0),
+                             nir_channel(b, words, 1), t2,
+                             nir_channel(b, words, 3));
+
+   nir_src_rewrite(&tex->src[ci].src, nir_trim_vector(b, coord, 2));
+   tex->coord_components = 2;
+   tex->is_array = false;
+   nir_tex_instr_add_src(tex, nir_tex_src_texture_handle, state);
+   return true;
+}
+
 /* A 3D texture is one texel (max_texture_3d_levels = 1: the volume layout
  * isn't the driver's yet, TEX.md section 14), kept as a 1x1 2D texture
  * (sgx_resource), which every (s, t, r) reads whatever the wrap and filter:
@@ -715,6 +763,9 @@ struct prog_info {
       bool fetch;     /* a texelFetch: state of its own (sgx_draw.c) */
       unsigned plane; /* an RG32 / RGBA32 unit's plane (channel) */
       unsigned state; /* its texture state block */
+      /* the program's state, in r<state_r> on (a 2D array layer's) */
+      bool state_in_r;
+      unsigned state_r;
       uint64_t smp;
    } deps[SGX_MAX_DEP_SAMPLES];
    unsigned n_deps;
@@ -748,8 +799,11 @@ insert_samples(const uint64_t *code, unsigned count,
          uint32_t lo = (uint32_t)info->deps[j].smp,
                   hi = info->deps[j].smp >> 32;
 
+         /* (the program's own state: r, bank 0) */
          lo = (lo & ~(0x7fu << 21 | 0x7fu << 7 | 0xc0000000u)) |
-              info->deps[j].raw << 21 | sa[j] << 7 | 0xc0000000u;
+              info->deps[j].raw << 21 |
+              (info->deps[j].state_in_r ? info->deps[j].state_r << 7
+                                        : sa[j] << 7 | 0xc0000000u);
          hi &= ~(0x80u | 1u << 17);
          w[k++] = (uint64_t)hi << 32 | lo;
          w[k++] = (uint64_t)(0xf9200000u | (hi & 1)) << 32; /* wdf drc */
@@ -826,6 +880,8 @@ read_program(const struct sgx_shader *out, struct sgx_pipe_shader *so,
       info->deps[info->n_deps].fetch = x->fetch;
       info->deps[info->n_deps].plane = x->plane;
       info->deps[info->n_deps].state = x->state;
+      info->deps[info->n_deps].state_in_r = x->state_in_r;
+      info->deps[info->n_deps].state_r = x->state_r;
       if (x->state >= out->n_dep_states)
          return info->why = "dependent sample without texture state", false;
       info->n_deps++;
@@ -1465,8 +1521,14 @@ compile_shader(struct sgx_context *ctx, struct sgx_pipe_shader *so,
    }
    /* textureGrad, the Offset variants and texelFetch as smp can do them;
     * the sizes they ask for are lower_txs's */
-   if (opts.native_integers)
+   if (opts.native_integers) {
       NIR_PASS(_, nir, sgx_lower_tex, &opts);
+      /* (after it: a texelFetch of an array is a txl at the texel's centre
+       * by then, its layer the coordinate's z) */
+      if (!vertex)
+         NIR_PASS(_, nir, nir_shader_tex_pass, lower_tex_array,
+                  nir_metadata_control_flow, NULL);
+   }
    /* (a vertex program's sizes from its own units, fill_consts) */
    NIR_PASS(_, nir, nir_shader_instructions_pass, lower_txs,
             nir_metadata_control_flow, &opts.native_integers);
