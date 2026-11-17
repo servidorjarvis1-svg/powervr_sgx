@@ -891,6 +891,35 @@ lower_srgb_filter(nir_builder *b, nir_instr *instr, void *data)
    return true;
 }
 
+/* A texel of an snorm texture (sgx_tex_snorm), stored offset binary: the
+ * unorm value v the TPU returns (filtered: the map is linear) is
+ * (v * 255 - 128) / 127, clamped to -1 as GL clamps -128.  After
+ * nir_lower_tex: the view's swizzle then reads the decoded texel, and its 0
+ * and 1 are GL's own.  data: the units. */
+static bool
+lower_snorm_texel(nir_builder *b, nir_instr *instr, void *data)
+{
+   uint32_t units = *(const uint32_t *)data;
+
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+
+   if (tex->texture_index >= 32 || !(units >> tex->texture_index & 1) ||
+       nir_tex_instr_is_query(tex) || tex->is_shadow)
+      return false;
+   b->cursor = nir_after_instr(instr);
+   unsigned bits = tex->def.bit_size;
+   nir_def *v = nir_fmax(
+      b,
+      nir_ffma(b, &tex->def, nir_imm_floatN_t(b, 255.0 / 127.0, bits),
+               nir_imm_floatN_t(b, -128.0 / 127.0, bits)),
+      nir_imm_floatN_t(b, -1.0, bits));
+
+   nir_def_rewrite_uses_after(&tex->def, v);
+   return true;
+}
+
 /* the units a fragment shader takes shadow samples of */
 static uint32_t
 shadow_units(nir_shader *nir)
@@ -1380,6 +1409,11 @@ compile_shader(struct sgx_context *ctx, struct sgx_pipe_shader *so,
       NIR_PASS(_, nir, nir_shader_instructions_pass, lower_tex_3d,
                nir_metadata_control_flow, NULL);
       NIR_PASS(_, nir, nir_lower_tex, &tex);
+      /* after it: the swizzle's uses of the texel become the decoded one's,
+       * its 0 and 1 stay GL's */
+      if (so->snorm)
+         NIR_PASS(_, nir, nir_shader_instructions_pass, lower_snorm_texel,
+                  nir_metadata_control_flow, &so->snorm);
    }
    /* textureGrad, the Offset variants and texelFetch as smp can do them;
     * the sizes they ask for are lower_txs's */
@@ -2056,7 +2090,7 @@ sgx_fs_for(struct sgx_context *ctx, struct sgx_pipe_shader *fs)
    unsigned srgb = 0, unit;
    uint32_t srgb_filter = 0;
    uint16_t swz[PIPE_MAX_SAMPLERS] = {0};
-   uint32_t not_bgra = 0, depth = 0;
+   uint32_t not_bgra = 0, depth = 0, snorm = 0;
    uint8_t compare[PIPE_MAX_SAMPLERS] = {0};
    bool any_swz = false;
    uint8_t rt_int = 0, rt_srgb = 0;
@@ -2069,9 +2103,11 @@ sgx_fs_for(struct sgx_context *ctx, struct sgx_pipe_shader *fs)
 
    if (fs->kind != SGX_SHADER_COMPILED || !fs->nir)
       return fs;
-   /* an integer colour buffer takes its own packing (pack_int_outputs) */
+   /* an integer colour buffer takes its own packing (pack_int_outputs), and
+    * a float planar one its channel's F32 word a plane */
    if (sgx_cbuf(ctx)->texture &&
-       util_format_is_pure_integer(sgx_cbuf(ctx)->format))
+       (util_format_is_pure_integer(sgx_cbuf(ctx)->format) ||
+        sgx_tex_raw32(sgx_cbuf(ctx)->format)))
       rt_int = sgx_tex_raw32(sgx_cbuf(ctx)->format) > 1
                   ? 3 + ctx->rt_plane /* a plane: channel rt_plane */
                : sgx_tex_raw32(sgx_cbuf(ctx)->format) ? 2
@@ -2128,6 +2164,20 @@ sgx_fs_for(struct sgx_context *ctx, struct sgx_pipe_shader *fs)
       }
       if (!sgx_tex_bgra(v->format))
          not_bgra |= 1u << unit;
+      if (sgx_tex_snorm(v->format))
+         snorm |= 1u << unit;
+      /* float planes, which the TPU doesn't filter: LINEAR at one level is
+       * four taps in the shader, as for sRGB (lower_srgb_filter) */
+      if (sgx_tex_float_planes(v->format)) {
+         const struct pipe_sampler_state *ss = ctx->samplers[unit];
+
+         if (ss &&
+             (ss->mag_img_filter == PIPE_TEX_FILTER_LINEAR ||
+              ss->min_img_filter == PIPE_TEX_FILTER_LINEAR) &&
+             (ss->min_mip_filter == PIPE_TEX_MIPFILTER_NONE ||
+              v->u.tex.first_level == v->u.tex.last_level))
+            srgb_filter |= 1u << unit;
+      }
       /* one F32 word a texel (tex_f32): depth, and R32 (raw); RG32 and
        * RGBA32 a read a plane (tex_r32x2 / x4) */
       if (sgx_tex_raw32(v->format) == 1)
@@ -2166,8 +2216,8 @@ sgx_fs_for(struct sgx_context *ctx, struct sgx_pipe_shader *fs)
          any_swz = true;
       }
    }
-   if (!srgb && !any_swz && !not_bgra && !rt_int && !r32x4 && !r32x2 &&
-       !rt_target && !rt_srgb)
+   if (!srgb && !srgb_filter && !any_swz && !not_bgra && !rt_int && !r32x4 &&
+       !r32x2 && !rt_target && !rt_srgb && !snorm)
       return fs;
    for (unsigned i = 0; i < ARRAY_SIZE(fs->variants_srgb); i++) {
       if (fs->variants_srgb[i] && fs->variants_srgb[i]->srgb == srgb &&
@@ -2177,6 +2227,7 @@ sgx_fs_for(struct sgx_context *ctx, struct sgx_pipe_shader *fs)
           fs->variants_srgb[i]->rt_int == rt_int &&
           fs->variants_srgb[i]->rt_target == rt_target &&
           fs->variants_srgb[i]->rt_srgb == rt_srgb &&
+          fs->variants_srgb[i]->snorm == snorm &&
           !memcmp(&fs->variants_srgb[i]->rt_blend, &rt_blend,
                   sizeof(rt_blend)) &&
           !memcmp(fs->variants_srgb[i]->rt_blend_color, rt_blend_color,
@@ -2203,6 +2254,7 @@ sgx_fs_for(struct sgx_context *ctx, struct sgx_pipe_shader *fs)
    (*slot)->rt_int = rt_int;
    (*slot)->rt_target = rt_target;
    (*slot)->rt_srgb = rt_srgb;
+   (*slot)->snorm = snorm;
    memcpy(&(*slot)->rt_blend, &rt_blend, sizeof(rt_blend));
    memcpy((*slot)->rt_blend_color, rt_blend_color, sizeof(rt_blend_color));
    (*slot)->r32x4 = r32x4;
