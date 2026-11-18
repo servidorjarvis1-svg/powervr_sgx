@@ -202,6 +202,8 @@ struct sgx_varyings {
     * the one source it iterates flat */
    bool colour;
    unsigned set_comps[SGX_MAX_SETS];
+   /* the varyings don't fit the ten sets of four, packed (sgx_pack_varyings) */
+   bool overflow;
 };
 
 /* where the driver puts what the program reads (the USP's lists, decoded) */

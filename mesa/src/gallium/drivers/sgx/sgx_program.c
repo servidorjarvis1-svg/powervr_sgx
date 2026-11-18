@@ -724,7 +724,8 @@ assign_varyings(nir_shader *nir, struct sgx_varyings *vary, bool sprite)
    vary->point_size = sprite;
    if (sprite)
       vary->set_comps[0] = 2;
-   if (!sgx_pack_varyings(vary) && !warned) {
+   vary->overflow = !sgx_pack_varyings(vary);
+   if (vary->overflow && !warned) {
       fprintf(stderr, "sgx: varyings past ten sets of four components\n");
       warned = true;
    }
@@ -2093,6 +2094,8 @@ compile_shader(struct sgx_context *ctx, struct sgx_pipe_shader *so,
    return so->kind == SGX_SHADER_COMPILED;
 }
 
+static void sgx_delete_shader_state(struct pipe_context *pctx, void *hwcso);
+
 static void *
 sgx_create_shader_state(struct pipe_context *pctx,
                         const struct pipe_shader_state *cso)
@@ -2126,6 +2129,25 @@ sgx_create_shader_state(struct pipe_context *pctx,
                                0, NULL);
 
       ctx->stats.compile_ns += os_time_get_nano() - t;
+      /* More varyings than the ten sets of four hold (SGX_DEBUG=bigvary
+       * reports ES 3.0's 60 components): the link fails, with the reason,
+       * rather than the draws drawing nothing */
+      if (nir->info.stage == MESA_SHADER_FRAGMENT && so->vary &&
+          so->vary->overflow && cso->report_compile_error) {
+         unsigned comps = 0;
+         char msg[160];
+
+         for (unsigned i = 0; i < so->vary->n; i++)
+            comps += so->vary->v[i].rows * so->vary->v[i].comps;
+         snprintf(msg, sizeof(msg),
+                  "too many varyings for the SGX545: %u components as it lays "
+                  "them out (an integer's take two), where its ten texture "
+                  "coordinate sets hold 40", comps);
+         /* (st frees it) */
+         ((struct pipe_shader_state *)cso)->error_message = strdup(msg);
+         sgx_delete_shader_state(pctx, so);
+         return NULL;
+      }
       if (ok)
          return so;
    }

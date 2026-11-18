@@ -70,6 +70,8 @@ static const struct debug_named_value sgx_drv_debug_options[] = {
     "vertex texture fetch: 16 sampler units in the vertex stage (with glsl130 only, as the compiler samples in a vertex program with native integers): until it passes on a board"},
    {"xfb", SGX_DEBUG_XFB,
     "transform feedback (EXT_transform_feedback: a vertex program st's what it captures, docs/GL3.md H4), 4 buffers of 4 separate or 64 interleaved components as Intel's ICD; st packs varyings with it on"},
+   {"bigvary", SGX_DEBUG_BIGVARY,
+    "ES 3.0's varying limits, 16 vec4 (64 components) out of a vertex program and into a fragment one, which Chromium's ES 3.0 contexts require; the hardware's ten texture coordinate sets hold 40: a program past them fails to link, with the reason"},
    {"flushrt", SGX_DEBUG_FLUSH_RT,
     "send SGX_FLUSH_HW_RENDER_TARGET at a target's destruction (hangs a srvinit microkernel)"},
    DEBUG_NAMED_VALUE_END};
@@ -159,9 +161,16 @@ sgx_init_shader_caps(struct pipe_screen *pscreen)
       caps->max_control_flow_depth = 32;
       /* ISA.md: 16 attributes, 10 texture coordinate sets on the SGX545 */
       caps->max_inputs = s == MESA_SHADER_VERTEX ? f->vs_inputs : f->fs_inputs;
+      /* SGX_DEBUG=bigvary: ES 3.0's 60 components into a fragment program
+       * and 64 out of a vertex one, over the ten sets' 40; a program they
+       * don't hold fails at link (sgx_create_shader_state) */
+      if (s == MESA_SHADER_FRAGMENT && (sgx_drv_debug & SGX_DEBUG_BIGVARY))
+         caps->max_inputs = 16;
       /* fragment: one output a pass, so as many as colour buffers (MRT a
        * pass a buffer) */
-      caps->max_outputs = s == MESA_SHADER_VERTEX     ? f->vs_outputs
+      caps->max_outputs = s == MESA_SHADER_VERTEX
+                             ? ((sgx_drv_debug & SGX_DEBUG_BIGVARY) ? 17
+                                                                    : f->vs_outputs)
                           : sgx_drv_debug & SGX_DEBUG_NO_MRT ? 1
                                                              : 4;
       /* Constants live in SA registers, sa9 (sa10 in a vertex program) to
@@ -232,6 +241,10 @@ sgx_init_screen_caps(struct pipe_screen *pscreen)
    caps->texture_swizzle = true;
    /* GPU resets reported (sgx_get_device_reset_status): ARB_robustness */
    caps->device_reset_status_query = true;
+   /* SGX_DEBUG=bigvary: ES 3.0's 15 varying vectors and more (the default,
+    * 8, is ES 2.0's) */
+   if (sgx_drv_debug & SGX_DEBUG_BIGVARY)
+      caps->max_varyings = 16;
    /* blending is shader code (STATE.md section 3): any equation per channel */
    caps->blend_equation_separate = true;
    caps->uma = true;
