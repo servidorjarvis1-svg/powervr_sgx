@@ -261,6 +261,12 @@ style), unless it says capture. In order of how much each unblocks:
 - **H4, a store from a vertex program.** A vertex program `st`s its outputs to
   a driver buffer at `index × stride` (index from in0 via DOUTA). Read the
   buffer. Unblocks transform feedback.
+  **Done** (Clover Trail tablet, SGX545, 2026-11-18, `tools/isa/hwt_h4.py`
+  through `sgx_hwt`'s `vs` lines): a vertex program's `st.a.d` to a
+  register address (`ima32 r1, index, #16, BUF`) lands exact for all 60
+  vertices of 20 triangles, with no write past the last slot and nothing in
+  dmesg; the same program without the stores leaves the buffer zero. The
+  stores are visible to the CPU after the frame's flush with no extra fence.
 - **H5, occlusion queries.** No path is known. A DDK desktop-GL capture of
   `glBeginQuery(GL_SAMPLES_PASSED)` would show it, but that DDK needs X (it's
   GLX only). Otherwise, look for a counter in the render details' unknown
