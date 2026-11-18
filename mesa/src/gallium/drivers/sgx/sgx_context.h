@@ -42,35 +42,36 @@ struct sgx_const {
 #define SGX_MAX_CONSTS 256 /* SA dwords of constants (sa127 ends them) */
 /* fragment constants the driver fills: texture unit u's level-0 width and
  * height at SGX_K_TEXSIZE + 2u (st's textureSize, as its rectangle lookups
- * scale by it); past every uniform (128 vec4) and under the compiler's 1024 */
-#define SGX_K_TEXSIZE       1000
-#define SGX_K_TEXSIZE_UNITS 8
+ * scale by it); past every uniform (ES 3.0's 256 vec4 and the 9 st adds to a vertex
+ * program's, constants 0-1059) and under the compiler's SGX_MAX_CONST_K */
+#define SGX_K_TEXSIZE       1128
+#define SGX_K_TEXSIZE_UNITS 16
 /* the vertex constant the draw fills with gl_InstanceID, as a float
  * (sgx_program.c lower_instance_id) */
-#define SGX_K_INSTANCE 1016
+#define SGX_K_INSTANCE 1160
 /* The driver's block of constant numbers for programs compiled with the
  * compiler's native integers (docs/GL3.md, "Crossing the driver/compiler
  * line"): unit u's base-level width, height and depth at SGX_K_SIZE + 3u,
  * gl_InstanceID at SGX_K_INSTANCE_INT, all raw integers; uniform block n's
  * GPU address at SGX_K_UBO + n */
-#define SGX_K_SIZE         1024
+#define SGX_K_SIZE         1168
 #define SGX_K_SIZE_UNITS   16
-#define SGX_K_INSTANCE_INT 1072
-#define SGX_K_UBO          1080
+#define SGX_K_INSTANCE_INT 1216
+#define SGX_K_UBO          1224
 #define SGX_UBO_BYTES      65536 /* a block's size, GL_MAX_UNIFORM_BLOCK_SIZE */
 #define SGX_MAX_UBOS       12 /* load_ubo's blocks 0-11: constant buffers 1-12 */
 /* unit u's level count (textureQueryLevels, and the compiler's own level
  * choice for word-by-word fetches) at SGX_K_LEVELS + u, a raw integer */
-#define SGX_K_LEVELS       1096
+#define SGX_K_LEVELS       1236
 /* unit u's texture state for a 2D array's layers (sgx_program.c
  * lower_tex_array), raw words from SGX_K_TEXSTATE + 10u: T0-T3 for the
  * bound sampler, T0-T3 for a texelFetch, the bytes from one layer to the
  * next, the view's layer count */
-#define SGX_K_TEXSTATE     1112
+#define SGX_K_TEXSTATE     1252
 #define SGX_K_TEXSTATE_N   10
 /* transform feedback buffer b's capture address - 4 (the compiler's xfb_k:
  * st.a.d #i writes base + 4 * (i + 1)), a raw word */
-#define SGX_K_XFB          1272
+#define SGX_K_XFB          1412
 
 /* a fragment program's dependent samples, and their texture state blocks
  * (the compiler's sgx_sample_info.state: one per way a unit is read, 4 SA
