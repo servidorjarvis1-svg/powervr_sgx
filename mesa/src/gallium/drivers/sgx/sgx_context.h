@@ -68,6 +68,9 @@ struct sgx_const {
  * next, the view's layer count */
 #define SGX_K_TEXSTATE     1112
 #define SGX_K_TEXSTATE_N   10
+/* transform feedback buffer b's capture address - 4 (the compiler's xfb_k:
+ * st.a.d #i writes base + 4 * (i + 1)), a raw word */
+#define SGX_K_XFB          1272
 
 /* a fragment program's dependent samples, and their texture state blocks
  * (the compiler's sgx_sample_info.state: one per way a unit is read, 4 SA
@@ -99,6 +102,11 @@ struct sgx_pipe_shader {
     * under native integers, otherwise a float */
    unsigned vertex_id_slot;
    bool vertex_id_int;
+   /* vertex: transform feedback's slot input (attribute slot + 1, 0: no
+    * capture), which the draw fills with each captured vertex's number,
+    * and the capture's dwords per vertex per buffer */
+   unsigned xfb_slot;
+   uint16_t xfb_stride[PIPE_MAX_SO_BUFFERS];
    /* fragment: the shader's code, kept for the blend variants (the colour
     * epilogue is the blend, sgxws_blend) */
    uint64_t *code; /* with the dependent samples' smp put in */
@@ -305,7 +313,34 @@ struct sgx_context {
    unsigned instance, base_instance;
    bool warned_shader, warned_prim, warned_blend, warned_varyings, warned_cube,
       warned_frag_depth;
+
+   /* transform feedback (SGX_DEBUG=xfb): the bound buffers */
+   struct pipe_stream_output_target *so_targets[PIPE_MAX_SO_BUFFERS];
+   unsigned num_so_targets;
+   /* the draw's capture addresses (SGX_K_XFB), and where a pass that only
+    * repeats a capture (MRT, planes) stores it instead */
+   uint32_t xfb_base[PIPE_MAX_SO_BUFFERS];
+   struct sgxws_bo xfb_scratch;
+   unsigned xfb_scratch_size;
+   /* primitives the capture wrote / the draws generated, for queries */
+   uint64_t xfb_prims_written, xfb_prims_generated;
 };
+
+/* a transform feedback buffer: where the next vertex goes, in bytes from
+ * buffer_offset (an append after a pause carries on from it) */
+struct sgx_so_target {
+   struct pipe_stream_output_target base;
+   unsigned written;
+   /* the device memory the vertex program stores into (buffer_size bytes
+    * from buffer_offset), copied into the buffer after the draw */
+   struct sgxws_bo bo;
+};
+
+static inline struct sgx_so_target *
+sgx_so_target(struct pipe_stream_output_target *t)
+{
+   return (struct sgx_so_target *)t;
+}
 
 /* the blend state's render target for the pass being drawn (rt_index) */
 static inline unsigned
@@ -335,6 +370,7 @@ void sgx_stats_report(struct sgx_context *ctx);
 void sgx_flush_frame(struct sgx_context *ctx);
 /* submit it and wait for every render submitted */
 void sgx_finish(struct sgx_context *ctx);
+void sgx_buffer_written(struct sgx_context *ctx, struct sgx_resource *res);
 /* before the CPU touches res: finish any frame that renders into it */
 void sgx_flush_resource_writes(struct sgx_context *ctx,
                                struct sgx_resource *res);

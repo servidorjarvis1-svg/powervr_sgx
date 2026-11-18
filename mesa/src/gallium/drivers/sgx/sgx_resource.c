@@ -556,6 +556,22 @@ vbo_release(struct sgx_screen *screen, struct sgx_resource *res)
    vbo_retire(screen, &res->vbo, res->vbo_seq);
 }
 
+/* A buffer's CPU copy written outside a map (transform feedback's capture
+ * copied in, with the GPU idle): the vertex cache's copies and the device
+ * copy are stale */
+void
+sgx_buffer_written(struct sgx_context *ctx, struct sgx_resource *res)
+{
+   struct sgx_screen *screen = sgx_screen(ctx->base.screen);
+
+   res->gen++;
+   res->written_ns = os_time_get_nano();
+   simple_mtx_lock(&screen->lock);
+   if (sgxws_bo_valid(&res->vbo))
+      vbo_release(screen, res);
+   simple_mtx_unlock(&screen->lock);
+}
+
 /* The buffer's device copy for a draw that reads bytes [off, off + size) of
  * it (screen lock held).  Unmaps copy what was written, so a copy is current
  * unless the buffer is mapped for writes still (a stream uploader writes more

@@ -528,9 +528,11 @@ sgx_texture_barrier(struct pipe_context *pctx, unsigned flags)
 {
 }
 
-/* queries: none of GLES2's need the GPU yet */
+/* queries: none of GLES2's need the GPU yet; transform feedback's count on
+ * the CPU (xfb_draw), from begin to end */
 struct sgx_query {
    unsigned type;
+   uint64_t written[2], generated[2];
 };
 
 static struct pipe_query *
@@ -549,17 +551,59 @@ sgx_destroy_query(struct pipe_context *pctx, struct pipe_query *q)
    FREE(q);
 }
 
-static bool
-sgx_begin_end_query(struct pipe_context *pctx, struct pipe_query *q)
+static void
+query_snap(struct pipe_context *pctx, struct pipe_query *pq, unsigned end)
 {
+   struct sgx_context *ctx = sgx_context(pctx);
+   struct sgx_query *q = (struct sgx_query *)pq;
+
+   q->written[end] = ctx->xfb_prims_written;
+   q->generated[end] = ctx->xfb_prims_generated;
+   if (!end)
+      q->written[1] = q->written[0], q->generated[1] = q->generated[0];
+}
+
+static bool
+sgx_begin_query(struct pipe_context *pctx, struct pipe_query *q)
+{
+   query_snap(pctx, q, 0);
    return true;
 }
 
 static bool
-sgx_get_query_result(struct pipe_context *pctx, struct pipe_query *q, bool wait,
-                     union pipe_query_result *result)
+sgx_end_query(struct pipe_context *pctx, struct pipe_query *q)
 {
+   query_snap(pctx, q, 1);
+   return true;
+}
+
+static bool
+sgx_get_query_result(struct pipe_context *pctx, struct pipe_query *pq,
+                     bool wait, union pipe_query_result *result)
+{
+   const struct sgx_query *q = (const struct sgx_query *)pq;
+   uint64_t written = q->written[1] - q->written[0],
+            generated = q->generated[1] - q->generated[0];
+
    memset(result, 0, sizeof(*result));
+   switch (q->type) {
+   case PIPE_QUERY_PRIMITIVES_EMITTED:
+      result->u64 = written;
+      break;
+   case PIPE_QUERY_PRIMITIVES_GENERATED:
+      result->u64 = generated;
+      break;
+   case PIPE_QUERY_SO_STATISTICS:
+      result->so_statistics.num_primitives_written = written;
+      result->so_statistics.primitives_storage_needed = generated;
+      break;
+   case PIPE_QUERY_SO_OVERFLOW_PREDICATE:
+   case PIPE_QUERY_SO_OVERFLOW_ANY_PREDICATE:
+      result->b = generated > written;
+      break;
+   default:
+      break;
+   }
    return true;
 }
 
@@ -959,6 +1003,54 @@ sgx_blit(struct pipe_context *pctx, const struct pipe_blit_info *info)
            util_format_short_name(info->dst.format));
 }
 
+static struct pipe_stream_output_target *
+sgx_create_so_target(struct pipe_context *pctx, struct pipe_resource *res,
+                     unsigned offset, unsigned size)
+{
+   struct sgx_so_target *t = CALLOC_STRUCT(sgx_so_target);
+
+   if (!t)
+      return NULL;
+   pipe_reference_init(&t->base.reference, 1);
+   pipe_resource_reference(&t->base.buffer, res);
+   t->base.context = pctx;
+   t->base.buffer_offset = offset;
+   t->base.buffer_size = size;
+   return &t->base;
+}
+
+static void
+sgx_so_target_destroy(struct pipe_context *pctx,
+                      struct pipe_stream_output_target *t)
+{
+   struct sgx_so_target *so = sgx_so_target(t);
+
+   if (sgxws_bo_valid(&so->bo)) {
+      sgx_finish(sgx_context(pctx));
+      sgxws_bo_free(sgx_screen(pctx->screen)->dev, &so->bo);
+   }
+   pipe_resource_reference(&t->buffer, NULL);
+   FREE(t);
+}
+
+/* offsets[i] == -1: append where the buffer's last capture stopped */
+static void
+sgx_set_so_targets(struct pipe_context *pctx, unsigned n,
+                   struct pipe_stream_output_target **targets,
+                   const unsigned *offsets, enum mesa_prim prim)
+{
+   struct sgx_context *ctx = sgx_context(pctx);
+
+   for (unsigned i = 0; i < PIPE_MAX_SO_BUFFERS; i++) {
+      struct pipe_stream_output_target *t = i < n ? targets[i] : NULL;
+
+      if (t && offsets[i] != (unsigned)-1)
+         sgx_so_target(t)->written = offsets[i];
+      pipe_so_target_reference(&ctx->so_targets[i], t);
+   }
+   ctx->num_so_targets = n;
+}
+
 void
 sgx_state_init(struct sgx_context *ctx)
 {
@@ -977,6 +1069,9 @@ sgx_state_init(struct sgx_context *ctx)
    p->bind_vertex_elements_state = sgx_bind_vertex_elements;
    p->delete_vertex_elements_state = sgx_delete_state;
    p->set_vertex_buffers = sgx_set_vertex_buffers;
+   p->create_stream_output_target = sgx_create_so_target;
+   p->stream_output_target_destroy = sgx_so_target_destroy;
+   p->set_stream_output_targets = sgx_set_so_targets;
    p->set_constant_buffer = sgx_set_constant_buffer;
    p->set_framebuffer_state = sgx_set_framebuffer_state;
    p->set_viewport_states = sgx_set_viewport_states;
@@ -997,8 +1092,8 @@ sgx_state_init(struct sgx_context *ctx)
    p->resource_release = u_default_resource_release;
    p->create_query = sgx_create_query;
    p->destroy_query = sgx_destroy_query;
-   p->begin_query = sgx_begin_end_query;
-   p->end_query = sgx_begin_end_query;
+   p->begin_query = sgx_begin_query;
+   p->end_query = sgx_end_query;
    p->get_query_result = sgx_get_query_result;
    p->set_active_query_state = sgx_set_active_query_state;
    p->resource_copy_region = sgx_resource_copy_region;

@@ -3173,6 +3173,45 @@ emit_load_ubo(struct sgx_ctx *c, nir_intrinsic_instr *in, struct sgx_val *v)
    v->comp = 0;
 }
 
+/* transform feedback (docs/GL3.md H4): this output's captured components,
+ * each st.a.d'd to its buffer at (its constant: the address - 4) + slot *
+ * stride, dword #i of the vertex's record, as a 32-bit word */
+static void
+emit_xfb(struct sgx_ctx *c, unsigned slot, unsigned wmask, unsigned comp0,
+         nir_legacy_src *ls)
+{
+   const struct sgx_compile_options *o = c->opts;
+   struct sgx_ref base[SGX_MAX_XFB_BUFFERS];
+   bool have[SGX_MAX_XFB_BUFFERS] = {false};
+
+   for (unsigned i = 0; i < o->xfb_n; i++) {
+      const struct sgx_xfb_out *x = &o->xfb[i];
+      unsigned k = x->at % 4, b = x->buffer;
+
+      if (x->at / 4 != slot || !(wmask & (1u << k)) ||
+          b >= SGX_MAX_XFB_BUFFERS)
+         continue;
+      if (!have[b]) {
+         c->const_used[o->xfb_k + b] = 1;
+         base[b] = vref(new_vreg(c, 1), 0);
+         emit_ima32(c, base[b], ref(SGX_F_PA, o->xfb_slot_pa),
+                    ref(SGX_F_K, o->xfb_stride[b] * 4u),
+                    ref(SGX_F_U, o->xfb_k + b), 0);
+         have[b] = true;
+      }
+      struct sgx_ref d[4] = {vref(new_vreg(c, 1), 0)};
+      struct sgx_ref ss[1][4] = {{src_comp(c, ls, k - comp0)}};
+      emit_runs(c, SGX_OP_MOV, 1, d, 1, ss, &NOF, 0);
+      struct sgx_ins *st = ins_alloc(c, SGX_INS_ALU, SGX_OP_ST);
+      st->nops = 3;
+      st->ndst = 0;
+      st->op[0] = base[b];
+      st->op[1] = ref(SGX_F_IMM, x->dword);
+      st->op[2] = d[0];
+      emit(c, st);
+   }
+}
+
 static void
 emit_intrinsic(struct sgx_ctx *c, nir_intrinsic_instr *in)
 {
@@ -3496,6 +3535,8 @@ emit_intrinsic(struct sgx_ctx *c, nir_intrinsic_instr *in)
       /* per component: a varying the fragment shader doesn't read, or the
        * linker's default point size, has no register */
       nir_legacy_src ls = nir_legacy_chase_src(&in->src[0]);
+      if (c->opts->xfb_n)
+         emit_xfb(c, slot, wmask, nir_intrinsic_component(in), &ls);
       struct sgx_ref d[4], ss[1][4];
       unsigned m = 0;
       if (slot == VARYING_SLOT_CLIP_DIST0 || slot == VARYING_SLOT_CLIP_DIST1) {

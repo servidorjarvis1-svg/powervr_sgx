@@ -267,6 +267,11 @@ style), unless it says capture. In order of how much each unblocks:
   vertices of 20 triangles, with no write past the last slot and nothing in
   dmesg; the same program without the stores leaves the buffer zero. The
   stores are visible to the CPU after the frame's flush with no extra fence.
+  Used by transform feedback (SGX_DEBUG=xfb, `mesa/tests/sgx_xfb.c`): with
+  `SGX_DEBUG=glsl130,ubo,xfb` Mesa computes ES 3.0 itself, no override.
+  Varying packing, which st turns on with the extension, changes nothing in
+  dEQP-GLES2.functional.shaders (10196/3/53 with and without xfb; the 3
+  fail on dev too).
 - **H5, occlusion queries.** No path is known. A DDK desktop-GL capture of
   `glBeginQuery(GL_SAMPLES_PASSED)` would show it, but that DDK needs X (it's
   GLX only). Otherwise, look for a counter in the render details' unknown

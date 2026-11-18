@@ -282,6 +282,10 @@ sgx_context_destroy(struct pipe_context *pctx)
    }
    for (unsigned i = 0; i < PIPE_MAX_SHADER_SAMPLER_VIEWS; i++)
       pipe_sampler_view_reference(&ctx->views[i], NULL);
+   for (unsigned i = 0; i < PIPE_MAX_SO_BUFFERS; i++)
+      pipe_so_target_reference(&ctx->so_targets[i], NULL);
+   if (sgxws_bo_valid(&ctx->xfb_scratch))
+      sgxws_bo_free(screen->dev, &ctx->xfb_scratch);
    if (pctx->stream_uploader)
       u_upload_destroy(pctx->stream_uploader);
 

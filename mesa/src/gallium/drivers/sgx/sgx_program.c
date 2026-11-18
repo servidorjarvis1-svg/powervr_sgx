@@ -21,6 +21,7 @@
  */
 
 #include "compiler/nir/nir.h"
+#include "compiler/nir/nir_xfb_info.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_format_convert.h"
 #include "nir/tgsi_to_nir.h"
@@ -1403,6 +1404,38 @@ fill_clip_dist0(nir_shader *nir)
    nir->info.outputs_written |= BITFIELD64_BIT(VARYING_SLOT_CLIP_DIST0);
 }
 
+/* transform feedback (SGX_DEBUG=xfb, docs/GL3.md H4): the compiler stores
+ * each captured component from the vertex program (sgx_compile.c emit_xfb)
+ * at its buffer's address (SGX_K_XFB + b) + slot * stride, slot an input in
+ * the attribute slot after the shader's own that the draw fills with the
+ * vertex's number in the capture (sgx_draw.c) */
+static void
+setup_xfb(const nir_shader *nir, struct sgx_compile_options *opts,
+          struct sgx_pipe_shader *so)
+{
+   const nir_xfb_info *x = nir->xfb_info;
+
+   so->xfb_slot = 0;
+   if (!(sgx_drv_debug & SGX_DEBUG_XFB) || !x || !x->output_count)
+      return;
+   for (unsigned i = 0; i < x->output_count; i++) {
+      const nir_xfb_output_info *o = &x->outputs[i];
+      unsigned dw = o->offset / 4;
+
+      u_foreach_bit (j, o->component_mask) {
+         if (opts->xfb_n == SGX_MAX_XFB_COMPONENTS || dw >= 128)
+            break;
+         opts->xfb[opts->xfb_n++] = (struct sgx_xfb_out){
+            .at = o->location * 4 + j, .buffer = o->buffer, .dword = dw++};
+      }
+   }
+   for (unsigned b = 0; b < PIPE_MAX_SO_BUFFERS; b++)
+      opts->xfb_stride[b] = so->xfb_stride[b] = nir->info.xfb_stride[b];
+   opts->xfb_slot_pa = 4 * so->n_attribs;
+   opts->xfb_k = SGX_K_XFB;
+   so->xfb_slot = ++so->n_attribs;
+}
+
 static bool
 compile_shader(struct sgx_context *ctx, struct sgx_pipe_shader *so,
                nir_shader *orig, const struct sgx_varyings *fs_vary,
@@ -1598,12 +1631,15 @@ compile_shader(struct sgx_context *ctx, struct sgx_pipe_shader *so,
             }
          }
       }
+      /* (from scratch: a recompile of this variant adds the slot again) */
+      so->n_attribs = 0;
       nir_foreach_shader_in_variable (var, nir) {
          if (var->name)
             so->n_attribs = MAX2(
                so->n_attribs, var->data.driver_location +
                                  glsl_count_attribute_slots(var->type, true));
       }
+      setup_xfb(nir, &opts, so);
    }
    if (sgx_drv_debug & SGX_DEBUG_NIR)
       nir_print_shader(nir, stderr);
