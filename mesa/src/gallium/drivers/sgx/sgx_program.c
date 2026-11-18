@@ -1456,8 +1456,14 @@ compile_shader(struct sgx_context *ctx, struct sgx_pipe_shader *so,
    /* The point size (st gives every vertex program one) is an output only
     * for points: elsewhere it costs a dword a vertex in the parameter buffer
     * and rounds the vertex up to the next four (the DDK's triangles carry
-    * none) */
-   if (vertex && !points) {
+    * none).  Unless transform feedback captures it: its store is where the
+    * capture is written (sgx_compile.c emit_xfb) */
+   bool xfb_psize = false;
+
+   for (unsigned i = 0; vertex && nir->xfb_info && i < nir->xfb_info->output_count;
+        i++)
+      xfb_psize |= nir->xfb_info->outputs[i].location == VARYING_SLOT_PSIZ;
+   if (vertex && !points && !xfb_psize) {
       bool demoted = false;
 
       nir_foreach_shader_out_variable (var, nir) {

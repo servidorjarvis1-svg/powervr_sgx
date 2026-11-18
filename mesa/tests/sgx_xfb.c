@@ -23,6 +23,8 @@
  * 11. a flat int output (raw integer bits)
  * 12. the capture drawn from: its positions as the next draw's vertices
  * 13. glBindBufferRange at an offset
+ * 14. gl_PointSize captured from triangles (a program not drawn as points
+ *     keeps the output when it's captured)
  *
  *   MESA_GLES_VERSION_OVERRIDE=3.0 SGX_DEBUG=glsl130,xfb DISPLAY=:0 sgx_xfb
  */
@@ -526,6 +528,31 @@ main(void)
    }
 
    bind_range(pf, xy, k, "13 glBindBufferRange offset 256, after 12");
+
+   /* 14: gl_PointSize = k + 1 out of triangles, under discard */
+   {
+      static const char *vs_ps =
+         "#version 300 es\nin vec2 a;\nin float k;\n"
+         "void main() { gl_PointSize = k + 1.0;"
+         " gl_Position = vec4(a, 0.0, 1.0); }\n";
+      const char *vars[] = {"gl_PointSize"};
+      GLuint p = prog(vs_ps, fs_white, vars, 1, GL_INTERLEAVED_ATTRIBS);
+      GLuint b = buffer(256);
+      float want[6];
+
+      for (int i = 0; i < 6; i++)
+         want[i] = k[i] + 1.0f;
+      glUseProgram(p);
+      attribs(xy, k);
+      glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, b);
+      glEnable(GL_RASTERIZER_DISCARD);
+      glBeginTransformFeedback(GL_TRIANGLES);
+      glDrawArrays(GL_TRIANGLES, 0, 6);
+      glEndTransformFeedback();
+      glDisable(GL_RASTERIZER_DISCARD);
+      glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, 0);
+      expect("14 gl_PointSize from triangles", b, 0, want, 6, 0.0f);
+   }
 
    GLenum e = glGetError();
    printf("GL error 0x%x\n", e);
