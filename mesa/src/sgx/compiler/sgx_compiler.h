@@ -55,6 +55,9 @@ struct sgx_layout {
    void *data;
 };
 
+#define SGX_MAX_XFB_BUFFERS    4
+#define SGX_MAX_XFB_COMPONENTS 64
+
 struct sgx_compile_options {
    const struct sgx_layout *layout; /* NULL: the compiler's own numbering */
    bool verbose;
@@ -129,6 +132,20 @@ struct sgx_compile_options {
     * conversion. Only output 0 so far. A load_output of output 0 reads the
     * tile's word in o0, for a blend the driver writes in NIR */
    uint8_t rt_packed;
+   /* vertex: transform feedback (docs/GL3.md H4). Each captured output
+    * component is st.a.d'd to its buffer at (xfb_k + buffer's constant) +
+    * slot * stride + 4 * dword, slot the raw integer the draw leaves in
+    * PA[xfb_slot_pa] (each captured vertex its own). The driver's constant
+    * holds the buffer's address - 4 (ISA.md: st.a.d #i writes base +
+    * 4 * (i + 1)). xfb_n = 0: no capture */
+   unsigned xfb_n;
+   struct sgx_xfb_out {
+      uint16_t at;    /* varying slot * 4 + component */
+      uint8_t buffer; /* 0-3 */
+      uint8_t dword;  /* in the vertex's record, < 128 */
+   } xfb[SGX_MAX_XFB_COMPONENTS];
+   uint16_t xfb_stride[SGX_MAX_XFB_BUFFERS]; /* dwords per vertex */
+   unsigned xfb_slot_pa, xfb_k;
 };
 
 /* nir_tex_instr.backend_flags: a texelFetch lowered to txl (the driver's

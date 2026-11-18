@@ -68,6 +68,8 @@ static const struct debug_named_value sgx_drv_debug_options[] = {
     "after every flushed render with a depth buffer, wait for it and write its ZLS buffer to /tmp/sgx-zls-<n>-<w>x<h>-<format>-s<samples>.bin (the layout test, docs/TEX.md section 7)"},
    {"vtf", SGX_DEBUG_VTF,
     "vertex texture fetch: 16 sampler units in the vertex stage (with glsl130 only, as the compiler samples in a vertex program with native integers): until it passes on a board"},
+   {"xfb", SGX_DEBUG_XFB,
+    "transform feedback (EXT_transform_feedback: a vertex program st's what it captures, docs/GL3.md H4), 4 buffers of 4 separate or 64 interleaved components as Intel's ICD; st packs varyings with it on"},
    {"flushrt", SGX_DEBUG_FLUSH_RT,
     "send SGX_FLUSH_HW_RENDER_TARGET at a target's destruction (hangs a srvinit microkernel)"},
    DEBUG_NAMED_VALUE_END};
@@ -267,6 +269,13 @@ sgx_init_screen_caps(struct pipe_screen *pscreen)
     * doesn't filter; LINEAR at one level is four taps in the shader
     * (sgx_tex_float_planes, lower_srgb_filter).  With them (glsl130) */
    caps->texture_half_float_linear = !!(sgx_drv_debug & SGX_DEBUG_GLSL130);
+   /* EXT_transform_feedback (SGX_DEBUG=xfb): the vertex program stores the
+    * captured outputs (docs/GL3.md H4), at the limits Intel's ICD gave */
+   if (sgx_drv_debug & SGX_DEBUG_XFB) {
+      caps->max_stream_output_buffers = 4;
+      caps->max_stream_output_separate_components = 4;
+      caps->max_stream_output_interleaved_components = 64;
+   }
    /* GL_FRAMEBUFFER_SRGB: st hands over a linear view of the buffer when it's
     * off, the sRGB one (encoded: lower_srgb_output) when on; with the sRGB
     * render targets (SGX_DEBUG=glsl130) */
