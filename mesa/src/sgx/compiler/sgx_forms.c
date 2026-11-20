@@ -125,6 +125,8 @@ static const struct sgx_form_info {
    [SGX_OP_IMA32] = {"IMA32", SGX_ISA_OPC_IMA32, 4, {D, S0X, S1, S2N}},
    [SGX_OP_SMP] = {"SMP", SGX_ISA_OPC_SMP, 4, {D1, S0X, S1, S2}},
    [SGX_OP_LD] = {"LD", SGX_ISA_OPC_LD, 3, {D1, S0X, S1}},
+   /* st.a.d base, #i, data: the dword at base + 4 * (i + 1) (ISA.md) */
+   [SGX_OP_ST] = {"ST", SGX_ISA_OPC_ST, 3, {S0X, S1, S2}},
    [SGX_OP_LIMM] = {"LIMM", SGX_ISA_OPC_LIMM, 2, {D, IMM}},
    [SGX_OP_WDF] = {"WDF", SGX_ISA_OPC_WDF, 0},
    [SGX_OP_BR] = {"BR", SGX_ISA_OPC_BR, 1, {IMM}},

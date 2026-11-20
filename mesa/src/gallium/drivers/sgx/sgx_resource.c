@@ -558,6 +558,22 @@ vbo_release(struct sgx_screen *screen, struct sgx_resource *res)
    vbo_retire(screen, &res->vbo, res->vbo_seq);
 }
 
+/* A buffer's CPU copy written outside a map (transform feedback's capture
+ * copied in, with the GPU idle): the vertex cache's copies and the device
+ * copy are stale */
+void
+sgx_buffer_written(struct sgx_context *ctx, struct sgx_resource *res)
+{
+   struct sgx_screen *screen = sgx_screen(ctx->base.screen);
+
+   res->gen++;
+   res->written_ns = os_time_get_nano();
+   simple_mtx_lock(&screen->lock);
+   if (sgxws_bo_valid(&res->vbo))
+      vbo_release(screen, res);
+   simple_mtx_unlock(&screen->lock);
+}
+
 /* The buffer's device copy for a draw that reads bytes [off, off + size) of
  * it (screen lock held).  Unmaps copy what was written, so a copy is current
  * unless the buffer is mapped for writes still (a stream uploader writes more
@@ -690,8 +706,8 @@ sgx_resource_target(struct sgx_screen *screen, struct sgx_resource *res,
 {
    memset(t, 0, sizeof(*t));
    t->bo = &res->bo;
-   /* an sRGB texture renders as its linear format: without
-    * EXT_framebuffer_sRGB nothing is encoded on the way out */
+   /* an sRGB texture renders as its linear format: the PBE stores the word
+    * as it is, the program having encoded it (lower_srgb_output) */
    switch (util_format_linear(res->base.format)) {
    case PIPE_FORMAT_B8G8R8A8_UNORM:
    case PIPE_FORMAT_B8G8R8X8_UNORM:
@@ -727,6 +743,7 @@ sgx_resource_target(struct sgx_screen *screen, struct sgx_resource *res,
    case PIPE_FORMAT_R32G32_SINT:
    case PIPE_FORMAT_R32G32B32A32_UINT:
    case PIPE_FORMAT_R32G32B32A32_SINT:
+   case PIPE_FORMAT_R11G11B10_FLOAT: /* F32 planes (sgx_tex_f32_conv) */
       t->pbe_format = 0;
       t->t1_format = SGX_TEXSTATE_FORMAT_F32;
       t->raw = true;

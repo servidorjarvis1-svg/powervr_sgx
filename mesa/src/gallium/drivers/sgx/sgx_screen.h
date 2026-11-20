@@ -41,6 +41,8 @@
 #define SGX_DEBUG_NO_TEX_BLITS       (1 << 24)
 #define SGX_DEBUG_NO_MERGE           (1 << 25)
 #define SGX_DEBUG_VTF                (1 << 26)
+#define SGX_DEBUG_XFB                (1 << 29)
+#define SGX_DEBUG_BIGVARY            (1 << 30)
 
 extern uint32_t sgx_drv_debug;
 bool sgx_vtf(void);

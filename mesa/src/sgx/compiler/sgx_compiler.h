@@ -55,6 +55,9 @@ struct sgx_layout {
    void *data;
 };
 
+#define SGX_MAX_XFB_BUFFERS    4
+#define SGX_MAX_XFB_COMPONENTS 64
+
 struct sgx_compile_options {
    const struct sgx_layout *layout; /* NULL: the compiler's own numbering */
    bool verbose;
@@ -129,7 +132,27 @@ struct sgx_compile_options {
     * conversion. Only output 0 so far. A load_output of output 0 reads the
     * tile's word in o0, for a blend the driver writes in NIR */
    uint8_t rt_packed;
+   /* vertex: transform feedback (docs/GL3.md H4). Each captured output
+    * component is st.a.d'd to its buffer at (xfb_k + buffer's constant) +
+    * slot * stride + 4 * dword, slot the raw integer the draw leaves in
+    * PA[xfb_slot_pa] (each captured vertex its own). The driver's constant
+    * holds the buffer's address - 4 (ISA.md: st.a.d #i writes base +
+    * 4 * (i + 1)). xfb_n = 0: no capture */
+   unsigned xfb_n;
+   struct sgx_xfb_out {
+      uint16_t at;    /* varying slot * 4 + component */
+      uint8_t buffer; /* 0-3 */
+      uint8_t dword;  /* in the vertex's record, < 128 */
+   } xfb[SGX_MAX_XFB_COMPONENTS];
+   uint16_t xfb_stride[SGX_MAX_XFB_BUFFERS]; /* dwords per vertex */
+   unsigned xfb_slot_pa, xfb_k;
 };
+
+/* nir_tex_instr.backend_flags: a texelFetch lowered to txl (the driver's
+ * lower_tex_array reads it too) */
+#define SGX_TEX_FETCH 1
+#define SGX_TEX_PLANAR 2 /* a plane of a tex_r32x4 / x2 unit: always dependent */
+#define SGX_TEX_PLANE_SHIFT 2
 
 /* a vertex attribute's raw format in PA, unpacked by the shader. Components
  * a format doesn't hold read as 0, 0, 1 (y, z, w) */
@@ -179,13 +202,15 @@ struct sgx_varyings {
     * the one source it iterates flat */
    bool colour;
    unsigned set_comps[SGX_MAX_SETS];
+   /* the varyings don't fit the ten sets of four, packed (sgx_pack_varyings) */
+   bool overflow;
 };
 
 /* where the driver puts what the program reads (the USP's lists, decoded) */
 #define SGX_SLOT_NONE     0xffff
 /* constant numbers: uniforms from 0, the driver's own above them; 1024 on
  * is the driver's block (docs/GL3.md) */
-#define SGX_MAX_CONST_K   1280
+#define SGX_MAX_CONST_K   1424
 #define SGX_MAX_CONST_MAP (SGX_MAX_CONST_K + 32) /* every constant and literal */
 /* a memory block window per 128 words (ld.a.d's offset is 7 bits): enough
  * for every slot of the map */
@@ -254,6 +279,9 @@ struct sgx_sample_info {
     * share one; the driver puts block k's four words in SA after the
     * constants, at 4k on */
    uint8_t state;
+   /* dependent: the state is the program's, its 4 words in r<state_r> on
+    * (a texture_handle source), not the block above */
+   uint8_t state_in_r, state_r;
    uint64_t smp; /* dependent: the smp, destination r0, texture state #0 */
 };
 
