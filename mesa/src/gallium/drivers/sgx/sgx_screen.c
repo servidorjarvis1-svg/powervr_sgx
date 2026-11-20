@@ -257,6 +257,20 @@ sgx_init_screen_caps(struct pipe_screen *pscreen)
     * GL_ARB_draw_buffers_blend (Portal and other Source games use
     * glColorMaskIndexedEXT, issue #5) */
    caps->indep_blend_enable = caps->indep_blend_func = true;
+   /* textureLod (and textureGrad, lowered to it: sgx_lower_tex) in a fragment
+    * shader: a dependent smp with its LOD (ARB_shader_texture_lod) */
+   caps->fragment_shader_texture_lod = true;
+   /* EXT_texture_array (2D arrays; lower_tex_array), with glsl130 */
+   if (sgx_drv_debug & SGX_DEBUG_GLSL130)
+      caps->max_texture_array_layers = 256;
+   /* OES_texture_half_float_linear: F16 textures are F32 planes the TPU
+    * doesn't filter; LINEAR at one level is four taps in the shader
+    * (sgx_tex_float_planes, lower_srgb_filter).  With them (glsl130) */
+   caps->texture_half_float_linear = !!(sgx_drv_debug & SGX_DEBUG_GLSL130);
+   /* GL_FRAMEBUFFER_SRGB: st hands over a linear view of the buffer when it's
+    * off, the sRGB one (encoded: lower_srgb_output) when on; with the sRGB
+    * render targets (SGX_DEBUG=glsl130) */
+   caps->dest_surface_srgb_control = !!(sgx_drv_debug & SGX_DEBUG_GLSL130);
    /* 1.30 with SGX_DEBUG=glsl130 (native integers, EXT_texture_integer),
     * for the GL 3.0 work's tests on a board */
    caps->glsl_feature_level = caps->glsl_feature_level_compatibility =
@@ -351,16 +365,24 @@ sgx_is_format_supported(struct pipe_screen *pscreen, enum pipe_format format,
           format != PIPE_FORMAT_R8_UINT && format != PIPE_FORMAT_R8_SINT &&
           format != PIPE_FORMAT_R8G8_UINT && format != PIPE_FORMAT_R8G8_SINT &&
           format != PIPE_FORMAT_R32_UINT && format != PIPE_FORMAT_R32_SINT &&
-          /* RG32 and RGBA32: a pass a channel into their planes; under
-           * SGX_DEBUG=glsl130 until that passes on a board */
+          /* RG32 and RGBA32: a pass a channel into their planes; and sRGB
+           * (encoded by the program, blended in it with integer ops:
+           * lower_srgb_output); under SGX_DEBUG=glsl130 until they pass on
+           * a board */
           !((sgx_drv_debug & SGX_DEBUG_GLSL130) &&
-            (format == PIPE_FORMAT_R32G32B32A32_UINT ||
+            (format == PIPE_FORMAT_R8G8B8A8_SRGB ||
+             format == PIPE_FORMAT_B8G8R8A8_SRGB ||
+             /* F32 planes, as RGBA32 (EXT_packed_float wants it rendered;
+              * sampled back converted, sgx_tex_f32_conv) */
+             format == PIPE_FORMAT_R11G11B10_FLOAT ||
+             format == PIPE_FORMAT_R32G32B32A32_UINT ||
              format == PIPE_FORMAT_R32G32B32A32_SINT ||
              format == PIPE_FORMAT_R32G32_UINT ||
              format == PIPE_FORMAT_R32G32_SINT)))
          return false;
       /* integer render targets aren't multisampled */
-      if (sample_count > 1 && util_format_is_pure_integer(format))
+      if (sample_count > 1 &&
+          (util_format_is_pure_integer(format) || sgx_tex_raw32(format)))
          return false;
    }
    if (usage & PIPE_BIND_DEPTH_STENCIL) {
@@ -368,7 +390,13 @@ sgx_is_format_supported(struct pipe_screen *pscreen, enum pipe_format format,
        * stored (no ZLS yet), so they are good within one render. */
       if (format != PIPE_FORMAT_Z16_UNORM &&
           format != PIPE_FORMAT_Z24X8_UNORM &&
-          format != PIPE_FORMAT_Z24_UNORM_S8_UINT)
+          format != PIPE_FORMAT_Z24_UNORM_S8_UINT &&
+          /* ARB_depth_buffer_float: the ISP and the ZLS keep every depth as
+           * float32 already, and the sampler reads it as F32 (sgx_tex_depth);
+           * the CPU copy keeps its own format */
+          !((sgx_drv_debug & SGX_DEBUG_GLSL130) &&
+            (format == PIPE_FORMAT_Z32_FLOAT ||
+             format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT)))
          return false;
    }
    if (usage & PIPE_BIND_VERTEX_BUFFER) {
@@ -390,6 +418,14 @@ sgx_is_format_supported(struct pipe_screen *pscreen, enum pipe_format format,
    if ((usage & PIPE_BIND_SAMPLER_VIEW) && !sgx_tex_format(format) &&
        !(usage & PIPE_BIND_RENDER_TARGET))
       return false;
+   /* float and snorm textures (F32 planes, sgx_tex_float_planes; offset
+    * binary bytes, sgx_tex_snorm): with the GL 3.0 work, until they pass on
+    * a board */
+   if ((usage & PIPE_BIND_SAMPLER_VIEW) &&
+       (sgx_tex_float_planes(format) || sgx_tex_snorm(format)) &&
+       format != PIPE_FORMAT_R32_FLOAT &&
+       !(sgx_drv_debug & SGX_DEBUG_GLSL130))
+      return false;
    /* RG32 and RGBA32 are stored for the compiler's word-by-word fetches
     * (sgx_tex_raw32), which it doesn't do yet: not sampled until it does */
    if ((usage & PIPE_BIND_SAMPLER_VIEW) && sgx_tex_raw32(format) > 1 &&
@@ -409,6 +445,12 @@ sgx_is_format_supported(struct pipe_screen *pscreen, enum pipe_format format,
    /* one texel, kept as a 2D texture (max_texture_3d_levels) */
    case PIPE_TEXTURE_3D:
       return true;
+   /* a 2D texture a layer at a layer stride, the program choosing the
+    * layer's address (sgx_program.c lower_tex_array): with the native
+    * integers it needs; not the planar formats (a plane is a whole chain) */
+   case PIPE_TEXTURE_2D_ARRAY:
+   case PIPE_TEXTURE_1D_ARRAY: /* a 2D one a texel high (lower_1d) */
+      return (sgx_drv_debug & SGX_DEBUG_GLSL130) && sgx_tex_raw32(format) < 2;
    default:
       return false;
    }

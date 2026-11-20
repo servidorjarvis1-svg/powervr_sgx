@@ -12,6 +12,7 @@
 
 #include "compiler/nir/nir.h"
 #include "util/format/u_format.h"
+#include "util/format_srgb.h"
 #include "util/half_float.h"
 #include "util/hash_table.h"
 #include "util/list.h"
@@ -419,6 +420,11 @@ clear_one(struct pipe_context *pctx, unsigned buffers,
       if (sgx_cbuf(ctx)->texture &&
           !util_format_has_alpha(sgx_cbuf(ctx)->format))
          rgba[3] = 1.0f;
+      /* an sRGB buffer: the clear colour encoded, as a draw's is */
+      if (sgx_cbuf(ctx)->texture && util_format_is_srgb(sgx_cbuf(ctx)->format))
+         for (unsigned c = 0; c < 3; c++)
+            rgba[c] =
+               util_format_linear_to_srgb_float(CLAMP(rgba[c], 0.0f, 1.0f));
       if (rg_whole) {
          if (!(tm & PIPE_MASK_G))
             rgba[1] = 0.0f;
@@ -428,8 +434,10 @@ clear_one(struct pipe_context *pctx, unsigned buffers,
        * converts back to exactly k (the colour word is B, G, R, A bytes):
        * each channel's low byte for an 8-bit format (1 for a missing
        * alpha), an R32 value's four bytes */
+      /* (a float planar one too: its plane's F32 word, color->ui) */
       if (sgx_cbuf(ctx)->texture &&
-          util_format_is_pure_integer(sgx_cbuf(ctx)->format)) {
+          (util_format_is_pure_integer(sgx_cbuf(ctx)->format) ||
+           sgx_tex_raw32(sgx_cbuf(ctx)->format))) {
          enum pipe_format f = sgx_cbuf(ctx)->format;
          uint32_t v = color->ui[0];
 
@@ -1017,6 +1025,18 @@ record_ubo(struct sgx_context *ctx, mesa_shader_stage stage, unsigned n,
    u->bytes = MIN2(u->bytes, (unsigned)SGX_UBO_BYTES);
 }
 
+/* a texelFetch reads the texel at an explicit level, whatever the bound
+ * sampler filters or wraps (the compiler's sgx_lower_tex puts the coordinate
+ * at the texel's centre) */
+static const struct pipe_sampler_state fetch_sampler = {
+   .wrap_s = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+   .wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+   .wrap_r = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+   .min_img_filter = PIPE_TEX_FILTER_NEAREST,
+   .mag_img_filter = PIPE_TEX_FILTER_NEAREST,
+   .min_mip_filter = PIPE_TEX_MIPFILTER_NEAREST,
+   .max_lod = 1000.0f,
+};
 /* A program's dependent samples' texture state: each block's 4 DOUTT words in
  * SA, block[so->dep_sa[j] - first] (first: the SA register block[0] goes
  * to); the units read into *sampled from bit `bit` (sampled_view). False
@@ -1039,19 +1059,9 @@ dep_states(struct sgx_context *ctx, const struct sgx_pipe_shader *so,
                  so->prog.vertex ? "vertex " : "", unit);
          return false;
       }
-      /* a texelFetch reads the texel at an explicit level, whatever the
-       * bound sampler filters or wraps (the compiler's sgx_lower_tex
-       * puts the coordinate at the texel's centre) */
-      const struct pipe_sampler_state fetch = {
-         .wrap_s = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
-         .wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
-         .wrap_r = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
-         .min_img_filter = PIPE_TEX_FILTER_NEAREST,
-         .mag_img_filter = PIPE_TEX_FILTER_NEAREST,
-         .min_mip_filter = PIPE_TEX_MIPFILTER_NEAREST,
-         .max_lod = 1000.0f,
-      };
-      sgx_tex_words(view, so->dep_fetch[j] ? &fetch : samplers[unit], w);
+      /* (a texelFetch: fetch_sampler) */
+      sgx_tex_words(view, so->dep_fetch[j] ? &fetch_sampler : samplers[unit],
+                    w);
       /* a read of plane c of an RG32 / RGBA32 texture: c planes on
        * (T2 is the address, unshifted) */
       if (so->dep_plane[j])
@@ -1144,6 +1154,32 @@ fill_consts(struct sgx_context *ctx, mesa_shader_stage stage,
          raw = true;
       }
 
+      if (stage == MESA_SHADER_FRAGMENT && k->k >= SGX_K_TEXSTATE &&
+          k->k < SGX_K_TEXSTATE + SGX_K_TEXSTATE_N * SGX_K_SIZE_UNITS) {
+         /* a 2D array's state (sgx_program.c lower_tex_array): the
+          * sampler's words and a texelFetch's for its first layer, the
+          * layer stride and the layer count */
+         unsigned u = (k->k - SGX_K_TEXSTATE) / SGX_K_TEXSTATE_N,
+                  w = (k->k - SGX_K_TEXSTATE) % SGX_K_TEXSTATE_N;
+         const struct pipe_sampler_view *view = ctx->views[u];
+         const struct pipe_resource *t = view ? view->texture : NULL;
+         uint32_t tw[4];
+
+         word = 0;
+         if (t && w < 8) {
+            size_t stride = sgx_tex_offset(t, 0, 1) - sgx_tex_offset(t, 0, 0);
+
+            sgx_tex_words(view, w < 4 ? ctx->samplers[u] : &fetch_sampler,
+                          tw);
+            tw[2] += (uint32_t)(view->u.tex.first_layer * stride);
+            word = tw[w & 3];
+         } else if (t && w == 8) {
+            word = (uint32_t)(sgx_tex_offset(t, 0, 1) - sgx_tex_offset(t, 0, 0));
+         } else if (t && w == 9) {
+            word = view->u.tex.last_layer - view->u.tex.first_layer + 1;
+         }
+         raw = true;
+      }
       if (k->k >= SGX_K_LEVELS && k->k < SGX_K_LEVELS + SGX_K_SIZE_UNITS) {
          /* a view's level count (sgx_program.c lower_txs): a texture of F32
           * words is sampled at its base level alone (sgx_tex_words) */
@@ -2010,11 +2046,14 @@ sgx_draw_vbo_impl(struct pipe_context *pctx, const struct pipe_draw_info *info,
       unsigned br = sgx_blend_rt(ctx->blend, ctx->rt_index);
 
       enum pipe_format cf = sgx_cbuf(ctx)->format;
-      bool int_rt = util_format_is_pure_integer(cf);
+      /* (a float planar target too: a word a plane, F32, not blended) */
+      bool int_rt = util_format_is_pure_integer(cf) || sgx_tex_raw32(cf);
 
       /* an integer target isn't blended (GL); its packed word is masked by
-       * byte, an R32 word being all of R */
-      if (ctx->blend && ctx->blend->enable[br] && !int_rt)
+       * byte, an R32 word being all of R.  An sRGB one is blended by the
+       * program, in linear (lower_srgb_output) */
+      if (ctx->blend && ctx->blend->enable[br] && !int_rt &&
+          !util_format_is_srgb(cf))
          epi = ctx->blend->hw[br][has_alpha];
       if (int_rt && sgx_tex_raw32(cf))
          mask = word_mask(ctx, mask);
@@ -2104,11 +2143,15 @@ sgx_draw_vbo_impl(struct pipe_context *pctx, const struct pipe_draw_info *info,
             SKIP("no blend variant of the fragment program");
       }
       /* pass type: a blend 1; discard 4, or 2 with a blend; a depthf
-       * (gl_FragDepth) 5 (ISA.md, H10) */
-      st.pass_type = fs->depth_pa >= 0       ? 5
-                     : fs->discard_pa >= 0   ? (blend && blend->blend ? 2 : 4)
-                     : blend && blend->blend ? 1
-                                             : 0;
+       * (gl_FragDepth) 5 (ISA.md, H10).  A program that reads the tile
+       * (an sRGB blend) is a blend: o0 holds the tile's colour only in a
+       * translucent pass */
+      bool blends = (blend && blend->blend) || fs->reads_tile;
+
+      st.pass_type = fs->depth_pa >= 0     ? 5
+                     : fs->discard_pa >= 0 ? (blends ? 2 : 4)
+                     : blends              ? 1
+                                           : 0;
       d.fs = &fsp;
       if (!d.ubos) {
          ctx->n_draw_ubos = 0;

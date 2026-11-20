@@ -62,6 +62,12 @@ struct sgx_const {
 /* unit u's level count (textureQueryLevels, and the compiler's own level
  * choice for word-by-word fetches) at SGX_K_LEVELS + u, a raw integer */
 #define SGX_K_LEVELS       1096
+/* unit u's texture state for a 2D array's layers (sgx_program.c
+ * lower_tex_array), raw words from SGX_K_TEXSTATE + 10u: T0-T3 for the
+ * bound sampler, T0-T3 for a texelFetch, the bytes from one layer to the
+ * next, the view's layer count */
+#define SGX_K_TEXSTATE     1112
+#define SGX_K_TEXSTATE_N   10
 
 /* a fragment program's dependent samples, and their texture state blocks
  * (the compiler's sgx_sample_info.state: one per way a unit is read, 4 SA
@@ -147,12 +153,22 @@ struct sgx_pipe_shader {
    uint32_t not_bgra; /* units bound to a texture not sampled B, G, R, A
                          ordered (sgx_tex_bgra) */
    uint32_t depth;    /* units bound to a depth texture (sgx_tex_depth) */
+   uint32_t snorm;    /* units bound to an snorm texture, stored offset
+                         binary (sgx_tex_snorm, lower_snorm_texel) */
    /* colour buffer 0 is an integer format (pack_int_outputs): 0 not, 1 one of
     * 8 bits a channel, 2 R32, 3 + c channel c's plane of RG32 / RGBA32 */
    uint8_t rt_int;
    /* MRT: 1 + the colour buffer this variant draws into, its DATA output
     * made output 0 (remap_outputs); 0 a single buffer */
    uint8_t rt_target;
+   /* colour buffer 0 is sRGB (lower_srgb_output): 0 not, 1 the colour
+    * encoded, 2 blended first, in linear, with the tile's colour decoded (as
+    * rt_blend and rt_blend_color say; the compiler's rt_packed), the sop2
+    * epilogue left out.  reads_tile: it does read the tile (pass type) */
+   uint8_t rt_srgb;
+   bool reads_tile;
+   struct pipe_rt_blend_state rt_blend; /* colormask 0: the epilogue's */
+   float rt_blend_color[4];             /* 0 unless a factor reads it */
    /* units bound to an RGBA32 / RG32 texture, read a plane at a time (the
     * compiler's tex_r32x4 / tex_r32x2) */
    uint32_t r32x4, r32x2;
