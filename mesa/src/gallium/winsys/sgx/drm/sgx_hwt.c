@@ -25,6 +25,14 @@
  *                       a line is its address
  *   texpat              optional: the same heap with dword i = 0x5a5a0000 | i,
  *                       so a texel read back names the dword it came from
+ *   vs phas.i @p1, #1   optional: the vertex program instead of the built-in
+ *   vs p1:              gl_Position = a0.xy one (docs/GL3.md, test H4), the
+ *                       same text, `name:` labels and `@name` phas.i targets;
+ *                       its attributes are x, y and the vertex's index (an
+ *                       integer's bits) in pa0-pa2
+ *   vcount N            optional, with vs: N vertices (a multiple of 3), the
+ *                       test's triangle drawn N / 3 times
+ *   dump N              optional: print the buffer's first N dwords
  *   eot limm r0, #RT    optional: the frame's end-of-tile program instead of
  *   eot raw HI LO       the target's (docs/GL3.md, test H1), the same text;
  *                       RT and RT2 in it are the two render targets'
@@ -51,7 +59,9 @@
 #include "sgx_isa_asm.h"
 
 #define MAX_INSTS 256
-#define BUF_DWORDS 64
+#define BUF_DWORDS 1024
+#define MAX_VS_INSTS 64
+#define MAX_VERTS 192
 #define TEX_DWORDS 1024
 
 /* a line with BUF / TEX replaced by the address */
@@ -102,14 +112,76 @@ assemble(const char *name, char lines[][160], unsigned n, uint64_t *code,
    return true;
 }
 
+/* the vertex program's lines (labels, @label targets, BUF) as words, low
+ * first; the instructions whose phas.i target is relative in reloc */
+static bool
+assemble_vs(const char *name, char lines[][160], unsigned n, uint32_t *w,
+            unsigned *nw, uint8_t *reloc, unsigned *nreloc, uint32_t buf_va)
+{
+   char label[16][32], err[128], text[200], t1[200];
+   unsigned at[16], nl = 0, k = 0;
+
+   for (unsigned i = 0; i < n; i++) {
+      size_t len = strlen(lines[i]);
+      if (len && lines[i][len - 1] == ':') {
+         if (nl < ARRAY_SIZE(label)) {
+            snprintf(label[nl], sizeof(label[0]), "%.*s", (int)(len - 1),
+                     lines[i]);
+            at[nl++] = k;
+         }
+      } else {
+         k++;
+      }
+   }
+   *nw = *nreloc = 0;
+   for (unsigned i = 0; i < n; i++) {
+      size_t len = strlen(lines[i]);
+      if (len && lines[i][len - 1] == ':')
+         continue;
+      const char *a = strchr(lines[i], '@');
+      if (a) {
+         size_t l = strcspn(a + 1, ", ");
+         unsigned j;
+         for (j = 0; j < nl; j++) {
+            if (strlen(label[j]) == l && !strncmp(label[j], a + 1, l))
+               break;
+         }
+         if (j == nl || *nreloc == 4) {
+            printf("%s error vs %s: no such label\n", name, lines[i]);
+            return false;
+         }
+         snprintf(t1, sizeof(t1), "%.*s#%u%s", (int)(a - lines[i]), lines[i],
+                  at[j], a + 1 + l);
+         reloc[(*nreloc)++] = *nw;
+      } else {
+         snprintf(t1, sizeof(t1), "%s", lines[i]);
+      }
+      subst(text, sizeof(text), t1, "BUF", buf_va);
+      struct sgx_isa_instr I;
+      if (!sgx_isa_asm_line(text, &I, err, sizeof(err))) {
+         printf("%s error vs %s: %s\n", name, text, err);
+         return false;
+      }
+      uint64_t x = sgx_isa_encode(&I, NULL);
+      w[2 * *nw] = (uint32_t)x;
+      w[2 * *nw + 1] = (uint32_t)(x >> 32);
+      (*nw)++;
+   }
+   return true;
+}
+
 static int
 run(struct sgxws_ctx *c, struct sgxws_rt *rt, struct sgxws_target *t,
     struct sgxws_bo *buf, struct sgxws_bo *tex, struct sgxws_bo *rt2,
     const char *name, char lines[][160], unsigned n, char eot[][160],
-    unsigned n_eot, const uint32_t *init, unsigned n_init, int has_texel,
+    unsigned n_eot, char vsl[][160], unsigned n_vs, unsigned vcount,
+    unsigned n_dump, const uint32_t *init, unsigned n_init, int has_texel,
     uint32_t texel, const uint32_t *pixels, uint32_t w, uint32_t h,
     uint32_t stride)
 {
+   static uint32_t xyi[MAX_VERTS * 3];
+   uint32_t vsw[2 * MAX_VS_INSTS], n_vsw = 0, nreloc = 0;
+   uint8_t reloc[4];
    static const float verts[6] = {-0.9f, -0.9f, 0.9f, -0.9f, 0.0f, 0.9f};
    const uint32_t va[4] = {buf->va, tex->va, rt2->va, t->va};
    uint64_t code[MAX_INSTS], eot_code[SGXWS_EOT_OVERRIDE_WORDS / 2];
@@ -132,7 +204,32 @@ run(struct sgxws_ctx *c, struct sgxws_rt *rt, struct sgxws_target *t,
    for (unsigned i = 0; i < TEX_DWORDS; i++)
       tex->map[i] = has_texel == 2 ? 0x5a5a0000u | i : has_texel ? texel : 0;
 
-   sgxws_prog_builtin(c, SGXWS_VS_XY, &vs);
+   if (n_vs) {
+      /* the triangle's corners again and again, each with its index */
+      if (!vcount || vcount % 3 || vcount > MAX_VERTS) {
+         printf("%s error vcount %u\n", name, vcount);
+         return 0;
+      }
+      for (unsigned i = 0; i < vcount; i++) {
+         memcpy(&xyi[3 * i], &verts[2 * (i % 3)], 8);
+         xyi[3 * i + 2] = i;
+      }
+      if (!assemble_vs(name, vsl, n_vs, vsw, &n_vsw, reloc, &nreloc, buf->va))
+         return 0;
+      memset(&vs, 0, sizeof(vs));
+      vs.vertex = true;
+      vs.code = sgxws_usse_upload(c, true, vsw, n_vsw, reloc, nreloc);
+      vs.in_dwords = 4;
+      vs.out_dwords = 4;
+      vs.attr_dwords = 3;
+      vs.temps = 8;
+      if (!vs.code) {
+         printf("%s error vs upload\n", name);
+         return 0;
+      }
+   } else {
+      sgxws_prog_builtin(c, SGXWS_VS_XY, &vs);
+   }
    /* the uniform-colour program's setup (its secondary loads sa9, which the
     * test doesn't read), the test as the main program */
    sgxws_prog_builtin(c, SGXWS_FS_UNIFORM, &fs);
@@ -156,8 +253,8 @@ run(struct sgxws_ctx *c, struct sgxws_rt *rt, struct sgxws_target *t,
    struct sgxws_draw d = {
       .fs_consts = fsc,
       .prim = SGXWS_TRIANGLES,
-      .count = 3,
-      .verts = (const uint32_t *)verts,
+      .count = n_vs ? vcount : 3,
+      .verts = n_vs ? xyi : (const uint32_t *)verts,
       .vs = &vs,
       .fs = &fs,
       .state = &st,
@@ -190,9 +287,9 @@ run(struct sgxws_ctx *c, struct sgxws_rt *rt, struct sgxws_target *t,
       printf("%s %08x", name, first);
    else
       printf("%s mixed %08x %08x", name, first, other);
-   if (n_init) {
+   if (n_init || n_dump) {
       printf(" buf");
-      for (unsigned i = 0; i < n_init; i++)
+      for (unsigned i = 0; i < MAX2(n_init, n_dump); i++)
          printf(" %08x", buf->map[i]);
    }
    if (n_eot)
@@ -254,7 +351,9 @@ main(int argc, char **argv)
    struct sgxws_target t = {.va = color.va, .stride = stride, .bo = &color,
                             .t1_format = 0x0c, .t1_layout = 6};
 
-   static char lines[MAX_INSTS][160], eot[SGXWS_EOT_OVERRIDE_WORDS / 2][160];
+   static char lines[MAX_INSTS][160], eot[SGXWS_EOT_OVERRIDE_WORDS / 2][160],
+      vsl[MAX_VS_INSTS + 16][160];
+   unsigned n_vs = 0, vcount = 3, n_dump = 0;
    char ln[256], name[64] = "";
    uint32_t init[BUF_DWORDS], texel = 0;
    unsigned n = 0, n_eot = 0, n_init = 0;
@@ -267,8 +366,16 @@ main(int argc, char **argv)
          continue;
       if (!strncmp(s, "test ", 5)) {
          snprintf(name, sizeof(name), "%s", s + 5);
-         n = n_eot = n_init = 0;
+         n = n_eot = n_init = n_vs = n_dump = 0;
+         vcount = 3;
          has_texel = 0;
+      } else if (!strncmp(s, "vs ", 3)) {
+         if (n_vs < ARRAY_SIZE(vsl))
+            snprintf(vsl[n_vs++], sizeof(vsl[0]), "%s", s + 3);
+      } else if (!strncmp(s, "vcount ", 7)) {
+         vcount = strtoul(s + 7, NULL, 0);
+      } else if (!strncmp(s, "dump ", 5)) {
+         n_dump = MIN2(strtoul(s + 5, NULL, 0), BUF_DWORDS);
       } else if (!strcmp(s, "texpat")) {
          has_texel = 2;
       } else if (!strncmp(s, "tex ", 4)) {
@@ -288,7 +395,8 @@ main(int argc, char **argv)
             snprintf(eot[n_eot++], sizeof(eot[0]), "%s", s + 4);
       } else if (!strcmp(s, "end")) {
          if (run(c, rt, &t, &buf, &tex, &color2, name, lines, n, eot, n_eot,
-                 init, n_init, has_texel, texel, color.map, w, h, stride)) {
+                 vsl, n_vs, vcount, n_dump, init, n_init, has_texel, texel,
+                 color.map, w, h, stride)) {
             status = 1;
             break;
          }

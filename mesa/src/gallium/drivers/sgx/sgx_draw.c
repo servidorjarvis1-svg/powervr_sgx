@@ -12,6 +12,7 @@
 
 #include "compiler/nir/nir.h"
 #include "util/format/u_format.h"
+#include "util/format_srgb.h"
 #include "util/half_float.h"
 #include "util/hash_table.h"
 #include "util/list.h"
@@ -419,6 +420,11 @@ clear_one(struct pipe_context *pctx, unsigned buffers,
       if (sgx_cbuf(ctx)->texture &&
           !util_format_has_alpha(sgx_cbuf(ctx)->format))
          rgba[3] = 1.0f;
+      /* an sRGB buffer: the clear colour encoded, as a draw's is */
+      if (sgx_cbuf(ctx)->texture && util_format_is_srgb(sgx_cbuf(ctx)->format))
+         for (unsigned c = 0; c < 3; c++)
+            rgba[c] =
+               util_format_linear_to_srgb_float(CLAMP(rgba[c], 0.0f, 1.0f));
       if (rg_whole) {
          if (!(tm & PIPE_MASK_G))
             rgba[1] = 0.0f;
@@ -428,8 +434,10 @@ clear_one(struct pipe_context *pctx, unsigned buffers,
        * converts back to exactly k (the colour word is B, G, R, A bytes):
        * each channel's low byte for an 8-bit format (1 for a missing
        * alpha), an R32 value's four bytes */
+      /* (a float planar one too: its plane's F32 word, color->ui) */
       if (sgx_cbuf(ctx)->texture &&
-          util_format_is_pure_integer(sgx_cbuf(ctx)->format)) {
+          (util_format_is_pure_integer(sgx_cbuf(ctx)->format) ||
+           sgx_tex_raw32(sgx_cbuf(ctx)->format))) {
          enum pipe_format f = sgx_cbuf(ctx)->format;
          uint32_t v = color->ui[0];
 
@@ -750,6 +758,8 @@ struct fetch {
    /* gl_VertexID (sgx_program.c lower_vertex_id): no buffer, the vertex's
     * index itself, an integer's bits or a float (vertex_id_int) */
    bool vertex_id, vertex_id_int;
+   /* transform feedback's slot input: filled by xfb_draw, not fetched */
+   bool xfb_slot;
    struct sgx_resource *res; /* the buffer, NULL for client memory */
    uint32_t offset;          /* where in it */
    unsigned vb;              /* its vertex buffer binding */
@@ -771,6 +781,7 @@ setup_fetch(struct sgx_context *ctx, unsigned e, struct fetch *f)
    f->res = NULL;
    f->raw = false;
    f->vertex_id = false;
+   f->xfb_slot = false;
    if (vb->is_user_buffer) {
       f->base = vb->buffer.user;
    } else if (vb->buffer.resource) {
@@ -805,12 +816,27 @@ setup_vertex_id(struct fetch *f, bool ints)
    f->stride = 4;
 }
 
+/* transform feedback's slot input (sgx_program.c setup_xfb): xfb_draw
+ * writes each vertex's number in it */
+static void
+setup_xfb_slot(struct fetch *f)
+{
+   memset(f, 0, sizeof(*f));
+   f->xfb_slot = true;
+   f->format = PIPE_FORMAT_R32_UINT;
+   f->stride = 4;
+}
+
 static void
 fetch_vertex(const struct fetch *f, unsigned index, uint32_t *out)
 {
    const uint8_t *src = f->base + (size_t)index * f->stride;
    float v[4] = {0, 0, 0, 1};
 
+   if (f->xfb_slot) {
+      out[0] = out[1] = out[2] = out[3] = 0;
+      return;
+   }
    if (f->vertex_id) {
       out[0] = f->vertex_id_int ? index : fui((float)index);
       out[1] = out[2] = 0;
@@ -1017,6 +1043,18 @@ record_ubo(struct sgx_context *ctx, mesa_shader_stage stage, unsigned n,
    u->bytes = MIN2(u->bytes, (unsigned)SGX_UBO_BYTES);
 }
 
+/* a texelFetch reads the texel at an explicit level, whatever the bound
+ * sampler filters or wraps (the compiler's sgx_lower_tex puts the coordinate
+ * at the texel's centre) */
+static const struct pipe_sampler_state fetch_sampler = {
+   .wrap_s = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+   .wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+   .wrap_r = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+   .min_img_filter = PIPE_TEX_FILTER_NEAREST,
+   .mag_img_filter = PIPE_TEX_FILTER_NEAREST,
+   .min_mip_filter = PIPE_TEX_MIPFILTER_NEAREST,
+   .max_lod = 1000.0f,
+};
 /* A program's dependent samples' texture state: each block's 4 DOUTT words in
  * SA, block[so->dep_sa[j] - first] (first: the SA register block[0] goes
  * to); the units read into *sampled from bit `bit` (sampled_view). False
@@ -1039,19 +1077,9 @@ dep_states(struct sgx_context *ctx, const struct sgx_pipe_shader *so,
                  so->prog.vertex ? "vertex " : "", unit);
          return false;
       }
-      /* a texelFetch reads the texel at an explicit level, whatever the
-       * bound sampler filters or wraps (the compiler's sgx_lower_tex
-       * puts the coordinate at the texel's centre) */
-      const struct pipe_sampler_state fetch = {
-         .wrap_s = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
-         .wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
-         .wrap_r = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
-         .min_img_filter = PIPE_TEX_FILTER_NEAREST,
-         .mag_img_filter = PIPE_TEX_FILTER_NEAREST,
-         .min_mip_filter = PIPE_TEX_MIPFILTER_NEAREST,
-         .max_lod = 1000.0f,
-      };
-      sgx_tex_words(view, so->dep_fetch[j] ? &fetch : samplers[unit], w);
+      /* (a texelFetch: fetch_sampler) */
+      sgx_tex_words(view, so->dep_fetch[j] ? &fetch_sampler : samplers[unit],
+                    w);
       /* a read of plane c of an RG32 / RGBA32 texture: c planes on
        * (T2 is the address, unshifted) */
       if (so->dep_plane[j])
@@ -1144,6 +1172,32 @@ fill_consts(struct sgx_context *ctx, mesa_shader_stage stage,
          raw = true;
       }
 
+      if (stage == MESA_SHADER_FRAGMENT && k->k >= SGX_K_TEXSTATE &&
+          k->k < SGX_K_TEXSTATE + SGX_K_TEXSTATE_N * SGX_K_SIZE_UNITS) {
+         /* a 2D array's state (sgx_program.c lower_tex_array): the
+          * sampler's words and a texelFetch's for its first layer, the
+          * layer stride and the layer count */
+         unsigned u = (k->k - SGX_K_TEXSTATE) / SGX_K_TEXSTATE_N,
+                  w = (k->k - SGX_K_TEXSTATE) % SGX_K_TEXSTATE_N;
+         const struct pipe_sampler_view *view = ctx->views[u];
+         const struct pipe_resource *t = view ? view->texture : NULL;
+         uint32_t tw[4];
+
+         word = 0;
+         if (t && w < 8) {
+            size_t stride = sgx_tex_offset(t, 0, 1) - sgx_tex_offset(t, 0, 0);
+
+            sgx_tex_words(view, w < 4 ? ctx->samplers[u] : &fetch_sampler,
+                          tw);
+            tw[2] += (uint32_t)(view->u.tex.first_layer * stride);
+            word = tw[w & 3];
+         } else if (t && w == 8) {
+            word = (uint32_t)(sgx_tex_offset(t, 0, 1) - sgx_tex_offset(t, 0, 0));
+         } else if (t && w == 9) {
+            word = view->u.tex.last_layer - view->u.tex.first_layer + 1;
+         }
+         raw = true;
+      }
       if (k->k >= SGX_K_LEVELS && k->k < SGX_K_LEVELS + SGX_K_SIZE_UNITS) {
          /* a view's level count (sgx_program.c lower_txs): a texture of F32
           * words is sampled at its base level alone (sgx_tex_words) */
@@ -1174,6 +1228,11 @@ fill_consts(struct sgx_context *ctx, mesa_shader_stage stage,
          raw = true;
       } else if (stage == MESA_SHADER_VERTEX && k->k == SGX_K_INSTANCE_INT) {
          word = ctx->instance;
+         raw = true;
+      } else if (stage == MESA_SHADER_VERTEX && k->k >= SGX_K_XFB &&
+                 k->k < SGX_K_XFB + PIPE_MAX_SO_BUFFERS) {
+         /* a capture's address - 4: st.a.d #i writes base + 4 * (i + 1) */
+         word = ctx->xfb_base[k->k - SGX_K_XFB] - 4;
          raw = true;
       }
       uint32_t bits,
@@ -1834,6 +1893,135 @@ sgx_draw_fini(struct sgx_context *ctx)
 }
 
 /* a draw that records nothing, and why (SGX_DEBUG=draw) */
+/* Transform feedback (SGX_DEBUG=xfb, docs/GL3.md H4): the draw as a list of
+ * its primitives' vertices in GL's order (expanded_vertex: a strip's odd
+ * triangles t+1, t, t+2, a fan's 0, t+1, t+2), each gathered on its own with
+ * its number in the capture in the slot input, so the vertex program runs
+ * once for each and stores it at its buffers' address (SGX_K_XFB) + number *
+ * stride.  Only whole primitives that fit in every buffer are drawn.  A
+ * pass that repeats the draw (MRT, planes: repeat) stores into
+ * ctx->xfb_scratch instead.  Returns the vertices captured. */
+static unsigned
+xfb_draw(struct sgx_context *ctx, const struct pipe_draw_info *info,
+         const struct pipe_draw_start_count_bias *draw, const void *indices,
+         const struct fetch *f, unsigned n_fetch, unsigned vertex_dwords,
+         struct sgxws_draw *d, struct sgx_pipe_shader *vs, uint32_t *vsc,
+         bool repeat)
+{
+   struct sgx_screen *screen = sgx_screen(ctx->base.screen);
+   enum mesa_prim mode = info->mode;
+   unsigned count = draw->count, per, full, out;
+   bool list = mode == MESA_PRIM_POINTS || mode == MESA_PRIM_LINES ||
+               mode == MESA_PRIM_TRIANGLES;
+
+   if (!u_trim_pipe_prim(mode, &count))
+      return 0;
+   full = out = list ? count : expanded_count(mode, count);
+   switch (u_reduced_prim(mode)) {
+   case MESA_PRIM_POINTS:
+      d->prim = SGXWS_POINTS;
+      per = 1;
+      break;
+   case MESA_PRIM_LINES:
+      d->prim = SGXWS_LINES;
+      per = 2;
+      break;
+   default:
+      d->prim = SGXWS_TRIANGLES;
+      per = 3;
+      break;
+   }
+   /* a repeat's stores: as much room as the largest buffer, made once (a
+    * larger buffer later repeats fewer primitives) */
+   if (repeat && !sgxws_bo_valid(&ctx->xfb_scratch)) {
+      unsigned size = 0;
+
+      for (unsigned b = 0; b < ctx->num_so_targets; b++)
+         if (ctx->so_targets[b])
+            size = MAX2(size, ctx->so_targets[b]->buffer_size);
+      size = align(MAX2(size, 4096), 4096);
+      if (sgxws_bo_alloc(screen->dev, &ctx->xfb_scratch, SGXWS_MEM_VERTEX, size,
+                         0x1000))
+         return 0;
+      ctx->xfb_scratch_size = size;
+   }
+   for (unsigned b = 0; b < ctx->num_so_targets; b++) {
+      struct pipe_stream_output_target *t = ctx->so_targets[b];
+      unsigned stride = vs->xfb_stride[b] * 4;
+
+      if (!t || !stride)
+         continue;
+      struct sgx_so_target *so = sgx_so_target(t);
+      unsigned room = repeat ? ctx->xfb_scratch_size
+                      : t->buffer_size > so->written ? t->buffer_size - so->written
+                                                     : 0;
+
+      out = MIN2(out, room / stride / per * per);
+      if (!sgxws_bo_valid(&so->bo) &&
+          sgxws_bo_alloc(screen->dev, &so->bo, SGXWS_MEM_VERTEX,
+                         align(t->buffer_size, 4096), 0x1000))
+         return 0;
+      ctx->xfb_base[b] = repeat ? ctx->xfb_scratch.va : so->bo.va + so->written;
+      sgxws_use_bo(ctx->hw, repeat ? &ctx->xfb_scratch : &so->bo, true);
+   }
+   ctx->xfb_prims_generated += repeat ? 0 : full / per;
+   if (!out)
+      return 0;
+   /* the vertex constants again, with these addresses */
+   ctx->n_draw_ubos = 0;
+   if (vs->mem_dwords)
+      mem_consts(ctx, MESA_SHADER_VERTEX, vs, vsc, 0, &d->vs_mem);
+   else
+      fill_consts(ctx, MESA_SHADER_VERTEX, vs, vsc, 0, NULL);
+   d->n_ubos = ctx->n_draw_ubos;
+   d->vs_consts = vsc;
+
+   const unsigned piece = 3072; /* whole points, lines and triangles */
+   for (unsigned p0 = 0; p0 < out; p0 += piece) {
+      unsigned np = MIN2(piece, out - p0);
+      uint32_t *v = staging(ctx, (size_t)np * vertex_dwords);
+
+      if (!v)
+         return p0;
+      for (unsigned i = p0; i < p0 + np; i++) {
+         unsigned k = list ? i : expanded_vertex(mode, i, full);
+         uint32_t index = info->index_size
+                             ? get_index(info, indices, draw->start + k) +
+                                  draw->index_bias
+                             : draw->start + k;
+         uint32_t *dst = v + (size_t)(i - p0) * vertex_dwords;
+
+         for (unsigned e = 0; e < n_fetch; e++) {
+            fetch_vertex(&f[e], index, dst);
+            if (f[e].xfb_slot)
+               dst[0] = i;
+            dst += f[e].dwords;
+         }
+      }
+      d->verts = v;
+      d->count = np;
+      d->indices = NULL;
+      SGX_DBG(DRAW, "xfb draw %s: vertices %u-%u of %u%s\n", u_prim_name(mode),
+              p0, p0 + np - 1, out, repeat ? " (repeat)" : "");
+      if (sgx_drv_debug & SGX_DEBUG_DRAW) {
+         for (unsigned e = 0; e < n_fetch; e++)
+            fprintf(stderr, "sgx:   input %u: %s stride %u%s%s%s\n", e,
+                    util_format_short_name(f[e].format), f[e].stride,
+                    f[e].res ? " buffer" : " client", f[e].xfb_slot ? " slot" : "",
+                    f[e].defaults ? " defaults" : "");
+         for (unsigned i = 0; i < MIN2(np, 2); i++) {
+            fprintf(stderr, "sgx:   vertex %u:", p0 + i);
+            for (unsigned w = 0; w < vertex_dwords; w++)
+               fprintf(stderr, " %08x", v[i * vertex_dwords + w]);
+            fprintf(stderr, "\n");
+         }
+      }
+      if (sgxws_draw(ctx->hw, d))
+         fprintf(stderr, "sgx: capture of %u vertices dropped\n", np);
+   }
+   return repeat ? 0 : out;
+}
+
 #define SKIP(why)                                                              \
    do {                                                                        \
       SGX_DBG(DRAW, "draw skipped: %s\n", why);                               \
@@ -1936,6 +2124,10 @@ sgx_draw_vbo_impl(struct pipe_context *pctx, const struct pipe_draw_info *info,
    bool points = info->mode == MESA_PRIM_POINTS;
    uint8_t vfmt[16] = {0};
    unsigned raw_bytes[16];
+   struct sgx_pipe_shader *cvs = NULL; /* the vertex program's variant */
+   /* transform feedback: the bytes of each buffer this call captured */
+   uint32_t xfb_from[PIPE_MAX_SO_BUFFERS] = {0}, xfb_to[PIPE_MAX_SO_BUFFERS] = {0};
+   bool xfb = false, xfb_captured = false;
 
    if (indirect || !ctx->vs || !ctx->fs)
       SKIP("indirect, or no vertex or fragment shader");
@@ -2010,11 +2202,14 @@ sgx_draw_vbo_impl(struct pipe_context *pctx, const struct pipe_draw_info *info,
       unsigned br = sgx_blend_rt(ctx->blend, ctx->rt_index);
 
       enum pipe_format cf = sgx_cbuf(ctx)->format;
-      bool int_rt = util_format_is_pure_integer(cf);
+      /* (a float planar target too: a word a plane, F32, not blended) */
+      bool int_rt = util_format_is_pure_integer(cf) || sgx_tex_raw32(cf);
 
       /* an integer target isn't blended (GL); its packed word is masked by
-       * byte, an R32 word being all of R */
-      if (ctx->blend && ctx->blend->enable[br] && !int_rt)
+       * byte, an R32 word being all of R.  An sRGB one is blended by the
+       * program, in linear (lower_srgb_output) */
+      if (ctx->blend && ctx->blend->enable[br] && !int_rt &&
+          !util_format_is_srgb(cf))
          epi = ctx->blend->hw[br][has_alpha];
       if (int_rt && sgx_tex_raw32(cf))
          mask = word_mask(ctx, mask);
@@ -2060,7 +2255,8 @@ sgx_draw_vbo_impl(struct pipe_context *pctx, const struct pipe_draw_info *info,
       /* zero-copy (sgx_screen.zero_copy): inputs the vertex shader unpacks
        * itself, when the compiler knows every format */
       raw = sgx_screen(ctx->base.screen)->zero_copy && ctx->velems &&
-            !ctx->vs->vertex_id_slot && ctx->vs->n_attribs <= 16 &&
+            !ctx->vs->vertex_id_slot && !ctx->vs->xfb_slot &&
+            ctx->vs->n_attribs <= 16 &&
             ctx->vs->n_attribs <= ctx->velems->num_elements;
       for (unsigned e = 0; raw && e < ctx->vs->n_attribs; e++)
          raw = vtx_format(ctx->velems->elements[e].src_format, &vfmt[e],
@@ -2093,6 +2289,8 @@ sgx_draw_vbo_impl(struct pipe_context *pctx, const struct pipe_draw_info *info,
       d.n_ubos = ctx->n_draw_ubos;
       d.vs_consts = vsc;
       n_fetch = ctx->vs->n_attribs;
+      cvs = vs;
+      xfb = ctx->vs->xfb_slot && ctx->num_so_targets;
    } else if (ctx->vs->kind != SGX_SHADER_VS_POSITION) {
       SKIP("a vertex shader that isn't compiled");
    }
@@ -2104,11 +2302,15 @@ sgx_draw_vbo_impl(struct pipe_context *pctx, const struct pipe_draw_info *info,
             SKIP("no blend variant of the fragment program");
       }
       /* pass type: a blend 1; discard 4, or 2 with a blend; a depthf
-       * (gl_FragDepth) 5 (ISA.md, H10) */
-      st.pass_type = fs->depth_pa >= 0       ? 5
-                     : fs->discard_pa >= 0   ? (blend && blend->blend ? 2 : 4)
-                     : blend && blend->blend ? 1
-                                             : 0;
+       * (gl_FragDepth) 5 (ISA.md, H10).  A program that reads the tile
+       * (an sRGB blend) is a blend: o0 holds the tile's colour only in a
+       * translucent pass */
+      bool blends = (blend && blend->blend) || fs->reads_tile;
+
+      st.pass_type = fs->depth_pa >= 0     ? 5
+                     : fs->discard_pa >= 0 ? (blends ? 2 : 4)
+                     : blends              ? 1
+                                           : 0;
       d.fs = &fsp;
       if (!d.ubos) {
          ctx->n_draw_ubos = 0;
@@ -2245,6 +2447,8 @@ sgx_draw_vbo_impl(struct pipe_context *pctx, const struct pipe_draw_info *info,
    for (unsigned e = 0; e < n_fetch; e++) {
       if (compiled && ctx->vs->vertex_id_slot == e + 1)
          setup_vertex_id(&f[e], ctx->vs->vertex_id_int);
+      else if (compiled && ctx->vs->xfb_slot == e + 1)
+         setup_xfb_slot(&f[e]);
       else if (!setup_fetch(ctx, e, &f[e]))
          SKIP("a vertex input it can't fetch");
       if (compiled) {
@@ -2271,6 +2475,16 @@ sgx_draw_vbo_impl(struct pipe_context *pctx, const struct pipe_draw_info *info,
             d.vs->tsp_sizes, sgx_pds_douti_w0(&d.fs->douti[0]));
       ctx->warned_varyings = true;
       return;
+   }
+   /* GL_RASTERIZER_DISCARD: no draw, or only the vertex program's capture
+    * (nothing written: no colour, depth or stencil) */
+   if (ctx->rasterizer && ctx->rasterizer->base.rasterizer_discard) {
+      if (!xfb)
+         return;
+      st.color_mask = 0;
+      st.depth_write = false;
+      st.depth_func = 0;
+      st.stencil = false;
    }
    d.state = &st;
    d.prim = prim;
@@ -2343,6 +2557,31 @@ sgx_draw_vbo_impl(struct pipe_context *pctx, const struct pipe_draw_info *info,
       out_count = list ? expanded_count(info->mode, count) : count;
       if (!out_count)
          continue;
+      if (xfb) {
+         bool repeat = ctx->rt_later_pass;
+         unsigned got = xfb_draw(ctx, info, &draws[n], indices, f, n_fetch,
+                                 vertex_dwords, &d, cvs, vsc, repeat);
+
+         for (unsigned b = 0; !repeat && b < ctx->num_so_targets; b++) {
+            struct sgx_so_target *so =
+               ctx->so_targets[b] ? sgx_so_target(ctx->so_targets[b]) : NULL;
+
+            if (!so || !cvs->xfb_stride[b])
+               continue;
+            if (!xfb_captured || xfb_to[b] == xfb_from[b])
+               xfb_from[b] = so->written;
+            so->written += got * cvs->xfb_stride[b] * 4;
+            xfb_to[b] = so->written;
+         }
+         if (!repeat) {
+            ctx->xfb_prims_written +=
+               got / (u_reduced_prim(info->mode) == MESA_PRIM_POINTS  ? 1
+                      : u_reduced_prim(info->mode) == MESA_PRIM_LINES ? 2
+                                                                      : 3);
+            xfb_captured = true;
+         }
+         continue;
+      }
       /* the vertex cache first: a display list drawn every frame is one DMA
        * a vertex from its cached gather and its quads' indices expanded
        * once, where zero-copy DMAs each input and expands them every draw
@@ -2481,6 +2720,25 @@ sgx_draw_vbo_impl(struct pipe_context *pctx, const struct pipe_draw_info *info,
    }
 out:
    simple_mtx_unlock(&screen->lock);
+   /* the capture into the buffers' CPU copies, where everything that reads
+    * a buffer looks (a draw's gather, a map, a copy): synchronous, the GPU
+    * idle first */
+   if (xfb_captured) {
+      sgx_finish(ctx);
+      for (unsigned b = 0; b < ctx->num_so_targets; b++) {
+         struct pipe_stream_output_target *t = ctx->so_targets[b];
+
+         if (!t || xfb_to[b] <= xfb_from[b])
+            continue;
+         struct sgx_so_target *so = sgx_so_target(t);
+         struct sgx_resource *res = sgx_resource(t->buffer);
+
+         memcpy((uint8_t *)res->data + t->buffer_offset + xfb_from[b],
+                (const uint8_t *)so->bo.map + xfb_from[b],
+                xfb_to[b] - xfb_from[b]);
+         sgx_buffer_written(ctx, res);
+      }
+   }
 }
 
 static void

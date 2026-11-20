@@ -86,6 +86,7 @@ enum sgx_form {
    /* hw 1c, 1d, 1f */
    SGX_OP_SMP,
    SGX_OP_LD,
+   SGX_OP_ST,
    SGX_OP_LIMM,
    SGX_OP_WDF,
    SGX_OP_BR,
