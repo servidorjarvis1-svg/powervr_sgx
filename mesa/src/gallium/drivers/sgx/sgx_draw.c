@@ -12,6 +12,7 @@
 
 #include "compiler/nir/nir.h"
 #include "util/format/u_format.h"
+#include "util/format_srgb.h"
 #include "util/half_float.h"
 #include "util/hash_table.h"
 #include "util/list.h"
@@ -419,6 +420,11 @@ clear_one(struct pipe_context *pctx, unsigned buffers,
       if (sgx_cbuf(ctx)->texture &&
           !util_format_has_alpha(sgx_cbuf(ctx)->format))
          rgba[3] = 1.0f;
+      /* an sRGB buffer: the clear colour encoded, as a draw's is */
+      if (sgx_cbuf(ctx)->texture && util_format_is_srgb(sgx_cbuf(ctx)->format))
+         for (unsigned c = 0; c < 3; c++)
+            rgba[c] =
+               util_format_linear_to_srgb_float(CLAMP(rgba[c], 0.0f, 1.0f));
       if (rg_whole) {
          if (!(tm & PIPE_MASK_G))
             rgba[1] = 0.0f;
@@ -1057,9 +1063,10 @@ dep_states(struct sgx_context *ctx, const struct sgx_pipe_shader *so,
       if (so->dep_plane[j])
          w[2] +=
             so->dep_plane[j] * (uint32_t)sgx_tex_plane_stride(view->texture);
-      /* an F16 texel: the whole T3, as for a PDS sample's */
+      /* an F16 texel: the whole T3, as for a PDS sample's, but a volume's
+       * depth */
       if (so->dep_f16[j])
-         w[3] = 0x01028800u;
+         w[3] = 0x01028800u | (w[3] & SGX_TEX_T3_DEPTH);
       sgx_resource(view->texture)->use_seq = sgxws_next_seq(ctx->hw);
       *sampled |= 1ull << (bit + unit);
       SGX_DBG(
@@ -1922,6 +1929,7 @@ sgx_draw_vbo_impl(struct pipe_context *pctx, const struct pipe_draw_info *info,
    struct sgxws_prog fsp;
    struct sgxws_blend epi = {0};
    const struct sgxws_blend *blend = NULL;
+   uint32_t query_va = 0;
    uint32_t fsc[SGXWS_FS_UNIFORM_DWORDS] = {0}, vsc[SGX_MAX_CONSTS] = {0};
    uint32_t fsk[9 + SGX_MAX_CONSTS] = {0}, tex[PIPE_MAX_SAMPLERS][4];
    const void *indices = NULL;
@@ -2013,8 +2021,10 @@ sgx_draw_vbo_impl(struct pipe_context *pctx, const struct pipe_draw_info *info,
       bool int_rt = util_format_is_pure_integer(cf);
 
       /* an integer target isn't blended (GL); its packed word is masked by
-       * byte, an R32 word being all of R */
-      if (ctx->blend && ctx->blend->enable[br] && !int_rt)
+       * byte, an R32 word being all of R.  An sRGB one is blended by the
+       * program, in linear (lower_srgb_output) */
+      if (ctx->blend && ctx->blend->enable[br] && !int_rt &&
+          !util_format_is_srgb(cf))
          epi = ctx->blend->hw[br][has_alpha];
       if (int_rt && sgx_tex_raw32(cf))
          mask = word_mask(ctx, mask);
@@ -2049,6 +2059,15 @@ sgx_draw_vbo_impl(struct pipe_context *pctx, const struct pipe_draw_info *info,
                   (mask & PIPE_MASK_R ? 4 : 0) | (mask & PIPE_MASK_A ? 8 : 0);
       if (epi.blend || epi.wmask != 0xf)
          blend = &epi;
+   }
+   /* an occlusion query counting: the program stores to its slot from every
+    * pixel it shades (sgx_state.c) */
+   query_va = fs->kind == SGX_SHADER_COMPILED ? sgx_query_va(ctx) : 0;
+   if (query_va) {
+      if (!blend)
+         epi.wmask = 0xf;
+      epi.visible = 1;
+      blend = &epi;
    }
    /* each stage compiled or one of the fixed programs */
    compiled = ctx->vs->kind == SGX_SHADER_COMPILED;
@@ -2104,11 +2123,18 @@ sgx_draw_vbo_impl(struct pipe_context *pctx, const struct pipe_draw_info *info,
             SKIP("no blend variant of the fragment program");
       }
       /* pass type: a blend 1; discard 4, or 2 with a blend; a depthf
-       * (gl_FragDepth) 5 (ISA.md, H10) */
-      st.pass_type = fs->depth_pa >= 0       ? 5
-                     : fs->discard_pa >= 0   ? (blend && blend->blend ? 2 : 4)
-                     : blend && blend->blend ? 1
-                                             : 0;
+       * (gl_FragDepth) 5 (ISA.md, H10).  A program that reads the tile
+       * (an sRGB blend) is a blend: o0 holds the tile's colour only in a
+       * translucent pass */
+      bool blends = (blend && blend->blend) || fs->reads_tile;
+
+      st.pass_type = fs->depth_pa >= 0     ? 5
+                     : fs->discard_pa >= 0 ? (blends ? 2 : 4)
+                     : blends              ? 1
+                                           : 0;
+      /* counted in submission order, as a translucent object is shaded */
+      if (query_va && !st.pass_type)
+         st.pass_type = 1;
       d.fs = &fsp;
       if (!d.ubos) {
          ctx->n_draw_ubos = 0;
@@ -2128,6 +2154,10 @@ sgx_draw_vbo_impl(struct pipe_context *pctx, const struct pipe_draw_info *info,
             float_to_ubyte(c[1]) << 8 | float_to_ubyte(c[2]);
          fsp.sec_dwords = MAX2(fsp.sec_dwords, 9);
          fsp.temps = MAX2(fsp.temps, 2);
+      }
+      if (query_va) {
+         fsk[SGXWS_VISIBLE_SA] = query_va;
+         fsp.sec_dwords = MAX2(fsp.sec_dwords, 9);
       }
       if (fs->uses_front_face) {
          fsk[SGX_SA_FRONT] =
@@ -2288,7 +2318,7 @@ sgx_draw_vbo_impl(struct pipe_context *pctx, const struct pipe_draw_info *info,
    /* every shared texture it samples goes in the render's buffer list: a
     * frame whose list is full is submitted first */
    {
-      const struct sgxws_bo *shared[64];
+      const struct sgxws_bo *shared[64 + 1]; /* (and the query slots) */
       unsigned n_shared = 0;
 
       u_foreach_bit64 (unit, sampled) {
@@ -2298,6 +2328,8 @@ sgx_draw_vbo_impl(struct pipe_context *pctx, const struct pipe_draw_info *info,
          if (tex->shared)
             shared[n_shared++] = &tex->bo;
       }
+      if (query_va)
+         shared[n_shared++] = &ctx->query_bo;
       if (!sgxws_use_bo_room(ctx->hw, shared, n_shared)) {
          sgxws_flush(ctx->hw, 0);
          ctx->recording = NULL;
@@ -2320,6 +2352,8 @@ sgx_draw_vbo_impl(struct pipe_context *pctx, const struct pipe_draw_info *info,
       if (tex->shared)
          sgxws_use_bo(ctx->hw, &tex->bo, false);
    }
+   if (query_va)
+      sgx_query_drawn(ctx);
    if (num_draws > 1 && prim != SGXWS_POINTS &&
        !(sgx_drv_debug & SGX_DEBUG_NO_MERGE) &&
        merged_draw(ctx, info, draws, num_draws, indices, f, n_fetch,

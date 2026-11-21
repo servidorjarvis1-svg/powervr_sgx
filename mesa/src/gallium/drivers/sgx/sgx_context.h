@@ -153,6 +153,14 @@ struct sgx_pipe_shader {
    /* MRT: 1 + the colour buffer this variant draws into, its DATA output
     * made output 0 (remap_outputs); 0 a single buffer */
    uint8_t rt_target;
+   /* colour buffer 0 is sRGB (lower_srgb_output): 0 not, 1 the colour
+    * encoded, 2 blended first, in linear, with the tile's colour decoded (as
+    * rt_blend and rt_blend_color say; the compiler's rt_packed), the sop2
+    * epilogue left out.  reads_tile: it does read the tile (pass type) */
+   uint8_t rt_srgb;
+   bool reads_tile;
+   struct pipe_rt_blend_state rt_blend; /* colormask 0: the epilogue's */
+   float rt_blend_color[4];             /* 0 unless a factor reads it */
    /* units bound to an RGBA32 / RG32 texture, read a plane at a time (the
     * compiler's tex_r32x4 / tex_r32x2) */
    uint32_t r32x4, r32x2;
@@ -215,6 +223,15 @@ struct sgx_context {
     * set_framebuffer_state to the framebuffer, with its depth buffer's
     * samples. */
    struct pipe_resource *dummy_cb;
+   /* occlusion queries (SGX_DEBUG=occlusion, sgx_state.c): the one counting
+    * (NULL when none is, or st has turned queries off around its own
+    * draws), and the slots their draws store to, one a begin, taken in turn
+    * (query_seq: the last frame each was drawn in; query_last: the last any
+    * was, once query_pending) */
+   struct sgx_query *occlusion;
+   bool queries_off, query_pending;
+   struct sgxws_bo query_bo;
+   uint32_t query_next, *query_seq, query_last;
    uint64_t rt_used[SGX_MAX_RTS], rt_clock;       /* when each was last taken */
    unsigned num_rts;
    struct sgx_resource *recording; /* the target of the frame being recorded */
@@ -312,6 +329,11 @@ struct pipe_context *sgx_context_create(struct pipe_screen *pscreen, void *priv,
                                         unsigned flags);
 
 void sgx_state_init(struct sgx_context *ctx);
+/* while an occlusion query counts: its slot's address less 4, for
+ * sa[SGXWS_VISIBLE_SA] (0 when none counts); and, once the draw is in the
+ * frame it renders in, the frame noted and the slots listed */
+uint32_t sgx_query_va(const struct sgx_context *ctx);
+void sgx_query_drawn(struct sgx_context *ctx);
 void sgx_draw_init(struct sgx_context *ctx);
 void sgx_draw_fini(struct sgx_context *ctx);
 void sgx_program_init(struct sgx_context *ctx);
